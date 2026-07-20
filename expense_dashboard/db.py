@@ -15,6 +15,7 @@ def connect(db_path: Path = DB_PATH) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
@@ -73,6 +74,18 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_obligations_type_name
             ON obligations(category_type, name);
+
+        CREATE TABLE IF NOT EXISTS obligation_monthly_budgets (
+            obligation_id INTEGER NOT NULL,
+            month TEXT NOT NULL,
+            expected_amount REAL NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (obligation_id, month),
+            FOREIGN KEY (obligation_id) REFERENCES obligations(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_monthly_budgets_month
+            ON obligation_monthly_budgets(month);
 
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
@@ -418,6 +431,22 @@ def ignore_transaction(conn: sqlite3.Connection, transaction_id_value: str) -> N
     conn.commit()
 
 
+def set_transaction_ignored(
+    conn: sqlite3.Connection,
+    transaction_id_value: str,
+    ignored: bool,
+) -> None:
+    conn.execute(
+        """
+        UPDATE transactions
+        SET excluded = ?
+        WHERE id = ?
+        """,
+        (1 if ignored else 0, transaction_id_value),
+    )
+    conn.commit()
+
+
 def get_setting(conn: sqlite3.Connection, key: str, default: str = "") -> str:
     row = conn.execute(
         "SELECT value FROM app_settings WHERE key = ?",
@@ -440,9 +469,13 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.commit()
 
 
-def load_transactions(conn: sqlite3.Connection) -> pd.DataFrame:
+def load_transactions(
+    conn: sqlite3.Connection,
+    include_excluded: bool = False,
+) -> pd.DataFrame:
+    excluded_filter = "" if include_excluded else "WHERE excluded = 0"
     return pd.read_sql_query(
-        """
+        f"""
         SELECT
             id,
             date,
@@ -452,9 +485,10 @@ def load_transactions(conn: sqlite3.Connection) -> pd.DataFrame:
             COALESCE(category_type, 'Uncategorized') AS category_type,
             COALESCE(category, 'Uncategorized') AS category,
             notes,
-            split_parent_id
+            split_parent_id,
+            excluded
         FROM transactions
-        WHERE excluded = 0
+        {excluded_filter}
         ORDER BY date DESC, amount DESC
         """,
         conn,
@@ -603,6 +637,40 @@ def load_obligations(conn: sqlite3.Connection) -> pd.DataFrame:
     )
 
 
+def load_monthly_budgets(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query(
+        """
+        SELECT obligation_id, month, expected_amount
+        FROM obligation_monthly_budgets
+        ORDER BY month, obligation_id
+        """,
+        conn,
+    )
+
+
+def save_monthly_budgets(
+    conn: sqlite3.Connection,
+    month: str,
+    amounts: dict[int, float],
+) -> None:
+    conn.executemany(
+        """
+        INSERT INTO obligation_monthly_budgets (
+            obligation_id, month, expected_amount, updated_at
+        )
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(obligation_id, month) DO UPDATE SET
+            expected_amount = excluded.expected_amount,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        [
+            (int(obligation_id), month, float(amount))
+            for obligation_id, amount in amounts.items()
+        ],
+    )
+    conn.commit()
+
+
 def add_obligation(
     conn: sqlite3.Connection,
     category_type: str,
@@ -685,6 +753,23 @@ def update_obligation(
             float(interest_rate),
             obligation_id,
         ),
+    )
+    conn.commit()
+
+
+def update_obligation_expected_amount(
+    conn: sqlite3.Connection,
+    obligation_id: int,
+    expected_amount: float,
+) -> None:
+    conn.execute(
+        """
+        UPDATE obligations
+        SET expected_amount = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (float(expected_amount), int(obligation_id)),
     )
     conn.commit()
 

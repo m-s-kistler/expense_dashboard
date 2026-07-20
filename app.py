@@ -18,13 +18,17 @@ from expense_dashboard.db import (
     init_db,
     ignore_transaction,
     get_setting,
+    load_monthly_budgets,
     load_obligations,
     load_transactions,
     seed_obligations,
+    save_monthly_budgets,
+    set_transaction_ignored,
     set_setting,
     split_transaction,
     sync_debt_details,
     update_obligation,
+    update_obligation_expected_amount,
     update_transaction,
     upsert_transactions,
 )
@@ -156,6 +160,101 @@ def filter_period(df: pd.DataFrame, period_mode: str, selected_month: str) -> pd
         return df
     dates = pd.to_datetime(df["date"])
     return df[dates.dt.to_period("M").astype(str) == selected_month]
+
+
+def resolve_monthly_budgets(
+    obligations: pd.DataFrame,
+    monthly_budgets: pd.DataFrame,
+    period_mode: str,
+    selected_month: str,
+) -> pd.DataFrame:
+    resolved = obligations.copy()
+    recurring_types = {"Monthly Bills", "Debt", "Savings"}
+    recurring = resolved["category_type"].isin(recurring_types) & resolved["month"].eq("")
+    if not recurring.any() or monthly_budgets.empty:
+        return resolved
+
+    overrides = monthly_budgets.copy()
+    overrides["obligation_id"] = overrides["obligation_id"].astype(int)
+    if period_mode == "Monthly":
+        month_amounts = overrides[overrides["month"].eq(selected_month)].set_index(
+            "obligation_id"
+        )["expected_amount"]
+        mapped = resolved["id"].map(month_amounts)
+        resolved.loc[recurring & mapped.notna(), "expected_amount"] = mapped
+        return resolved
+
+    year = pd.Period(selected_month).year
+    year_months = {f"{year}-{month:02d}" for month in range(1, 13)}
+    annual_overrides = overrides[overrides["month"].isin(year_months)].groupby(
+        "obligation_id"
+    )["expected_amount"].agg(["sum", "count"])
+    for index in resolved.index[recurring]:
+        obligation_id = int(resolved.at[index, "id"])
+        default = float(resolved.at[index, "expected_amount"])
+        if obligation_id in annual_overrides.index:
+            values = annual_overrides.loc[obligation_id]
+            annual_total = float(values["sum"]) + (12 - int(values["count"])) * default
+            resolved.at[index, "expected_amount"] = annual_total / 12
+    return resolved
+
+
+def render_monthly_budget_editor(
+    conn,
+    obligations: pd.DataFrame,
+    monthly_budgets: pd.DataFrame,
+    selected_month: str,
+    key_prefix: str,
+) -> None:
+    editable = obligations[
+        obligations["category_type"].isin(["Monthly Bills", "Debt", "Savings"])
+        & obligations["month"].eq("")
+    ].copy()
+    if editable.empty:
+        st.caption("Add monthly bills, debt, or savings items in Setup first.")
+        return
+
+    overrides = monthly_budgets[monthly_budgets["month"].eq(selected_month)].set_index(
+        "obligation_id"
+    )["expected_amount"]
+    editable["monthly_amount"] = editable["id"].map(overrides)
+    editable["monthly_amount"] = editable["monthly_amount"].fillna(
+        editable["expected_amount"]
+    )
+    editor = editable[["id", "category_type", "name", "expected_amount", "monthly_amount"]]
+    edited = st.data_editor(
+        editor,
+        use_container_width=True,
+        hide_index=True,
+        disabled=["id", "category_type", "name", "expected_amount"],
+        key=f"{key_prefix}-monthly-budget-{selected_month}",
+        column_config={
+            "id": None,
+            "category_type": "Type",
+            "name": "Item",
+            "expected_amount": st.column_config.NumberColumn(
+                "Default", format="$%.2f"
+            ),
+            "monthly_amount": st.column_config.NumberColumn(
+                f"{display_month(selected_month)} Budget",
+                min_value=0.0,
+                step=1.0,
+                format="$%.2f",
+                required=True,
+            ),
+        },
+    )
+    if st.button("Save monthly budgets", key=f"{key_prefix}-save-{selected_month}"):
+        save_monthly_budgets(
+            conn,
+            selected_month,
+            {
+                int(row["id"]): float(row["monthly_amount"])
+                for _, row in edited.iterrows()
+            },
+        )
+        st.success(f"Saved budgets for {display_month(selected_month)}.")
+        st.rerun()
 
 
 def build_category_map(obligations: pd.DataFrame) -> dict[str, list[str]]:
@@ -537,7 +636,7 @@ def render_unpaid_panel(
         return
 
     due_lookup = period_obligations(obligations, period_mode, selected_month)[
-        ["category_type", "name", "month", "due_day"]
+        ["id", "category_type", "name", "month", "due_day"]
     ].rename(columns={"name": "category"})
     display = comparison.merge(
         due_lookup,
@@ -587,17 +686,74 @@ def render_unpaid_panel(
         "Remaining amount",
         f"${current_amount - total_unpaid:,.2f}",
     )
-    st.dataframe(
-        display[["Type", "Name", "Month", "Due", "Budgeted", "Actual", "Difference"]],
+    unpaid_columns = [
+        "id",
+        "Type",
+        "Name",
+        "Month",
+        "Due",
+        "Budgeted",
+        "Actual",
+        "Difference",
+    ]
+    if period_mode == "Monthly":
+        st.caption("Edit Budgeted amounts directly, then save the unpaid table.")
+    edited_unpaid = st.data_editor(
+        display[unpaid_columns],
         use_container_width=True,
         hide_index=True,
         height=compact_table_height(len(display), 420),
+        disabled=(
+            ["id", "Type", "Name", "Month", "Due", "Actual", "Difference"]
+            if period_mode == "Monthly"
+            else unpaid_columns
+        ),
+        key=f"unpaid-budget-editor-{period_mode}-{selected_month}",
         column_config={
-            "Budgeted": st.column_config.NumberColumn(format="$%.2f"),
+            "id": None,
+            "Budgeted": st.column_config.NumberColumn(
+                format="$%.2f", step=0.01, required=True
+            ),
             "Actual": st.column_config.NumberColumn(format="$%.2f"),
             "Difference": st.column_config.NumberColumn(format="$%.2f"),
         },
     )
+    if period_mode == "Monthly" and st.button(
+        "Save unpaid budget edits",
+        key=f"save-unpaid-budgets-{selected_month}",
+    ):
+        original_amounts = display.set_index("id")["Budgeted"]
+        changed_rows = edited_unpaid[
+            edited_unpaid.apply(
+                lambda row: float(row["Budgeted"])
+                != float(original_amounts.loc[int(row["id"])]),
+                axis=1,
+            )
+        ]
+        monthly_amounts = {
+            int(row["id"]): float(row["Budgeted"])
+            for _, row in changed_rows.iterrows()
+            if row["Type"] in {"Monthly Bills", "Debt"}
+        }
+        if monthly_amounts:
+            save_monthly_budgets(conn, selected_month, monthly_amounts)
+        for _, row in changed_rows.iterrows():
+            if row["Type"] == "Non-Monthly Bills":
+                update_obligation_expected_amount(
+                    conn,
+                    int(row["id"]),
+                    float(row["Budgeted"]),
+                )
+        if changed_rows.empty:
+            st.info("No unpaid budget changes to save.")
+        else:
+            logger.info(
+                "Updated %s budget amounts from unpaid table for %s",
+                len(changed_rows),
+                selected_month,
+            )
+            st.success(f"Saved {len(changed_rows):,} budget changes.")
+            st.rerun()
 
 
 def render_add_transaction(conn, category_map: dict[str, list[str]]) -> None:
@@ -936,6 +1092,8 @@ def render_split_editor(
 def render_setup(
     conn,
     obligations: pd.DataFrame,
+    effective_obligations: pd.DataFrame,
+    monthly_budgets: pd.DataFrame,
     df: pd.DataFrame,
     period_mode: str,
     selected_month: str,
@@ -945,10 +1103,28 @@ def render_setup(
         "Manage bills, debt, savings, and non-monthly bills. Items with an "
         "expected amount of $0 stay configured but do not appear in the unpaid panel."
     )
-    summary = budget_summary(df, obligations, period_mode, selected_month)
+    summary = budget_summary(df, effective_obligations, period_mode, selected_month)
     col1, col2 = st.columns(2)
     col1.metric("Left to Budget", f"${summary['left_to_budget']:,.2f}")
     col2.metric("Total Budgeted", f"${summary['total_budgeted']:,.2f}")
+
+    if period_mode == "Monthly":
+        with st.expander(
+            f"Monthly budget amounts — {display_month(selected_month)}",
+            expanded=True,
+        ):
+            st.caption(
+                "Edit this month's amounts. The default is used for months without an override."
+            )
+            render_monthly_budget_editor(
+                conn,
+                obligations,
+                monthly_budgets,
+                selected_month,
+                "setup",
+            )
+    else:
+        st.info("Switch the sidebar period to Monthly to edit month-specific budgets.")
 
     tabs = st.tabs(
         [
@@ -1094,26 +1270,26 @@ def render_setup(
 
             with st.expander(f"Edit or remove {category_type}"):
                 choices = {
-                    (
+                    int(row["id"]): (
                         f"{row['name']} "
                         f"{'[' + str(row['month']) + '] ' if row['month'] else ''}"
                         f"(${float(row['expected_amount']):,.2f})"
-                    ): int(row["id"])
+                    )
                     for _, row in current.iterrows()
                 }
-                selected = st.selectbox(
+                selected_id = st.selectbox(
                     "Item",
                     list(choices.keys()),
+                    format_func=choices.get,
                     key=f"edit-obligation-select-{category_type}",
                 )
-                selected_id = choices[selected]
                 row = current[current["id"] == selected_id].iloc[0]
 
-                with st.form(f"edit-obligation-{category_type}"):
+                with st.form(f"edit-obligation-{category_type}-{selected_id}"):
                     name = st.text_input(
                         "Name",
                         value=row["name"],
-                        key=f"edit-name-{category_type}",
+                        key=f"edit-name-{category_type}-{selected_id}",
                     )
                     col1, col2, col3 = st.columns(3)
                     month = None
@@ -1127,7 +1303,7 @@ def render_setup(
                             "Month",
                             MONTH_SHEETS,
                             index=MONTH_SHEETS.index(current_month),
-                            key=f"edit-month-{category_type}",
+                            key=f"edit-month-{category_type}-{selected_id}",
                         )
                     due_day = col1.number_input(
                         "Due day",
@@ -1139,7 +1315,7 @@ def render_setup(
                             else 0
                         ),
                         step=1,
-                        key=f"edit-due-{category_type}",
+                        key=f"edit-due-{category_type}-{selected_id}",
                         disabled=category_type in {"Income", "Variable Expenses", "Savings"},
                     )
                     expected_amount = col2.number_input(
@@ -1148,7 +1324,7 @@ def render_setup(
                         value=float(row["expected_amount"]),
                         step=1.0,
                         format="%.2f",
-                        key=f"edit-amount-{category_type}",
+                        key=f"edit-amount-{category_type}-{selected_id}",
                     )
                     balance = float(row.get("balance", 0) or 0)
                     minimum_payment = float(row.get("minimum_payment", 0) or 0)
@@ -1160,7 +1336,7 @@ def render_setup(
                             value=balance,
                             step=100.0,
                             format="%.2f",
-                            key=f"edit-balance-{category_type}",
+                            key=f"edit-balance-{category_type}-{selected_id}",
                         )
                         minimum_payment = col2.number_input(
                             "Minimum payment",
@@ -1168,7 +1344,7 @@ def render_setup(
                             value=minimum_payment,
                             step=10.0,
                             format="%.2f",
-                            key=f"edit-minimum-{category_type}",
+                            key=f"edit-minimum-{category_type}-{selected_id}",
                         )
                         interest_rate_percent = col3.number_input(
                             "Interest rate %",
@@ -1176,7 +1352,7 @@ def render_setup(
                             value=interest_rate * 100,
                             step=0.1,
                             format="%.3f",
-                            key=f"edit-rate-{category_type}",
+                            key=f"edit-rate-{category_type}-{selected_id}",
                         )
                         interest_rate = interest_rate_percent / 100
                     col_save, col_delete = st.columns(2)
@@ -1231,6 +1407,7 @@ def render_debt_paydown(obligations: pd.DataFrame) -> None:
     st.subheader("Payoff Projection")
     display = summary.copy()
     display["payoff_date"] = pd.to_datetime(display["payoff_date"]).dt.strftime("%Y-%m")
+    display["interest_rate"] = display["interest_rate"] * 100
     st.dataframe(
         display[
             [
@@ -1260,7 +1437,7 @@ def render_debt_paydown(obligations: pd.DataFrame) -> None:
             ),
             "interest_rate": st.column_config.NumberColumn(
                 "Interest Rate",
-                format="%.2%",
+                format="%.2f%%",
             ),
             "months_to_payoff": "Months",
             "payoff_date": "Payoff Month",
@@ -1487,45 +1664,94 @@ def render_transactions(
     if df.empty:
         st.info("No transactions imported yet.")
         return
-    st.caption(f"Showing {len(df):,} transactions for the selected period.")
+    st.caption(
+        f"Showing {len(df):,} transactions for the selected period. "
+        "Edit cells directly, then save the table."
+    )
     visible = df.reset_index(drop=True).copy()
     table_df = visible[
         [
+            "id",
             "date",
             "amount",
             "category_type",
             "category",
             "description",
             "source",
+            "notes",
+            "excluded",
         ]
     ].copy()
-    table_df["description"] = table_df["description"].map(clipped_text)
-    table_event = st.dataframe(
+    table_df["date"] = pd.to_datetime(table_df["date"]).dt.date
+    table_df["notes"] = table_df["notes"].fillna("")
+    table_df["excluded"] = table_df["excluded"].astype(bool)
+    category_values = sorted(
+        {
+            category
+            for values in category_map.values()
+            for category in values
+            if category
+        }
+        | {"Uncategorized"}
+    )
+    edited = st.data_editor(
         table_df,
         use_container_width=True,
         hide_index=True,
         height=transaction_table_height(len(visible)),
         row_height=36,
-        on_select="rerun",
-        selection_mode="single-row",
-        key="transactions-table",
+        disabled=["id"],
+        key="transactions-editor",
         column_config={
-            "amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
-            "date": "Date",
-            "category_type": "Type",
-            "category": "Category",
-            "description": "Description",
-            "source": "Source",
+            "id": None,
+            "amount": st.column_config.NumberColumn(
+                "Amount", step=0.01, format="$%.2f", required=True
+            ),
+            "date": st.column_config.DateColumn("Date", required=True),
+            "category_type": st.column_config.SelectboxColumn(
+                "Type",
+                options=["Uncategorized"] + CATEGORY_TYPES,
+                required=True,
+            ),
+            "category": st.column_config.SelectboxColumn(
+                "Category",
+                options=category_values,
+                required=True,
+            ),
+            "description": st.column_config.TextColumn("Description", required=True),
+            "source": st.column_config.TextColumn("Source", required=True),
+            "notes": st.column_config.TextColumn("Notes"),
+            "excluded": st.column_config.CheckboxColumn(
+                "Ignored",
+                help="Ignored transactions are excluded from dashboard totals.",
+                default=False,
+            ),
         },
     )
-    selected_rows = table_event.selection.rows if table_event.selection else []
-    if selected_rows:
-        selected_row = visible.iloc[selected_rows[0]]
-        render_selected_transaction_editor(conn, selected_row, category_map)
-        st.caption("Full selected transaction")
-        st.dataframe(
-            pd.DataFrame([selected_row])[
-            [
+    if st.button("Save table edits", type="primary", key="save-transaction-table"):
+        invalid_rows = []
+        for index, row in edited.iterrows():
+            category_type = str(row["category_type"])
+            category = str(row["category"])
+            valid_categories = category_options(category_type, category_map)
+            if category_type == "Uncategorized":
+                valid = category == "Uncategorized"
+            else:
+                valid = category in valid_categories
+            if not valid:
+                invalid_rows.append(
+                    f"row {index + 1}: {category} is not a {category_type} category"
+                )
+        if invalid_rows:
+            st.error("Fix these category selections before saving: " + "; ".join(invalid_rows))
+            return
+
+        changed = 0
+        original_by_id = table_df.set_index("id")
+        for _, row in edited.iterrows():
+            transaction_id = row["id"]
+            original = original_by_id.loc[transaction_id]
+            comparable_fields = [
                 "date",
                 "amount",
                 "category_type",
@@ -1534,14 +1760,33 @@ def render_transactions(
                 "source",
                 "notes",
             ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-            row_height=36,
-            column_config={
-                "amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
-            },
-        )
+            fields_unchanged = all(
+                str(row[field]) == str(original[field])
+                for field in comparable_fields
+            )
+            ignored_changed = bool(row["excluded"]) != bool(original["excluded"])
+            if not fields_unchanged:
+                update_transaction(
+                    conn,
+                    transaction_id,
+                    pd.to_datetime(row["date"]).strftime("%Y-%m-%d"),
+                    float(row["amount"]),
+                    str(row["description"]).strip(),
+                    str(row["source"]).strip() or "Manual",
+                    nullable_category(str(row["category_type"])),
+                    nullable_category(str(row["category"])),
+                    str(row["notes"]).strip() or None,
+                )
+            if ignored_changed:
+                set_transaction_ignored(conn, transaction_id, bool(row["excluded"]))
+            if not fields_unchanged or ignored_changed:
+                changed += 1
+        logger.info("Updated %s transactions from editable table", changed)
+        if changed:
+            st.success(f"Saved {changed:,} transaction changes.")
+            st.rerun()
+        else:
+            st.info("No transaction changes to save.")
 
 
 def main() -> None:
@@ -1557,6 +1802,7 @@ def main() -> None:
     if seeded:
         logger.info("Seeded setup obligations from workbook: count=%s", seeded)
     obligations = load_obligations(conn)
+    monthly_budgets = load_monthly_budgets(conn)
     debt_details_missing = (
         not obligations[obligations["category_type"].eq("Debt")].empty
         and obligations.loc[
@@ -1588,6 +1834,7 @@ def main() -> None:
         )
 
     df = load_transactions(conn)
+    all_transactions = load_transactions(conn, include_excluded=True)
     months = month_options(df)
     period_mode = st.sidebar.segmented_control(
         "Period",
@@ -1603,6 +1850,12 @@ def main() -> None:
         disabled=period_mode == "Full year" or not months,
     )
     filtered = filter_period(df, period_mode, selected_month)
+    effective_obligations = resolve_monthly_budgets(
+        obligations,
+        monthly_budgets,
+        period_mode,
+        selected_month,
+    )
     dashboard_title = (
         f"Monthly Dashboard - {display_month(selected_month)}"
         if period_mode == "Monthly"
@@ -1611,12 +1864,37 @@ def main() -> None:
 
     if view == "Dashboard":
         render_metrics(filtered, dashboard_title)
-        render_budget_summary(filtered, obligations, period_mode, selected_month)
-        render_unpaid_panel(conn, filtered, period_mode, obligations, selected_month)
+        render_budget_summary(
+            filtered, effective_obligations, period_mode, selected_month
+        )
+        if period_mode == "Monthly":
+            with st.expander(
+                f"Edit monthly budgets — {display_month(selected_month)}"
+            ):
+                render_monthly_budget_editor(
+                    conn,
+                    obligations,
+                    monthly_budgets,
+                    selected_month,
+                    "dashboard",
+                )
+        render_unpaid_panel(
+            conn, filtered, period_mode, effective_obligations, selected_month
+        )
         render_charts(filtered)
-        render_budget_actual_charts(filtered, obligations, period_mode, selected_month)
+        render_budget_actual_charts(
+            filtered, effective_obligations, period_mode, selected_month
+        )
     elif view == "Setup":
-        render_setup(conn, obligations, filtered, period_mode, selected_month)
+        render_setup(
+            conn,
+            obligations,
+            effective_obligations,
+            monthly_budgets,
+            filtered,
+            period_mode,
+            selected_month,
+        )
     elif view == "Debt Paydown":
         render_debt_paydown(obligations)
     elif view == "Import":
@@ -1624,7 +1902,10 @@ def main() -> None:
     elif view == "Categorize":
         render_categorization(conn, df, category_map)
     else:
-        render_transactions(conn, filtered, category_map)
+        transaction_rows = filter_period(
+            all_transactions, period_mode, selected_month
+        )
+        render_transactions(conn, transaction_rows, category_map)
 
 
 if __name__ == "__main__":
