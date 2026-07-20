@@ -92,6 +92,17 @@ def init_db(conn: sqlite3.Connection) -> None:
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS bank_connections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            item_id TEXT NOT NULL UNIQUE,
+            institution_name TEXT NOT NULL,
+            encrypted_access_token TEXT NOT NULL,
+            sync_cursor TEXT,
+            last_synced_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
         """
     )
     conn.commit()
@@ -105,11 +116,20 @@ def _ensure_transaction_columns(conn: sqlite3.Connection) -> None:
     for column_name, column_definition in {
         "excluded": "INTEGER NOT NULL DEFAULT 0",
         "split_parent_id": "TEXT",
+        "bank_connection_id": "INTEGER",
+        "external_id": "TEXT",
     }.items():
         if column_name not in existing_columns:
             conn.execute(
                 f"ALTER TABLE transactions ADD COLUMN {column_name} {column_definition}"
             )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_transactions_external_id
+        ON transactions(bank_connection_id, external_id)
+        WHERE external_id IS NOT NULL
+        """
+    )
     conn.commit()
 
 
@@ -265,6 +285,108 @@ def upsert_transactions(conn: sqlite3.Connection, df: pd.DataFrame) -> int:
     )
     conn.commit()
     return conn.total_changes - before
+
+
+def save_bank_connection(
+    conn: sqlite3.Connection,
+    item_id: str,
+    institution_name: str,
+    encrypted_access_token: str,
+) -> int:
+    conn.execute(
+        """
+        INSERT INTO bank_connections (
+            provider, item_id, institution_name, encrypted_access_token
+        ) VALUES ('plaid', ?, ?, ?)
+        ON CONFLICT(item_id) DO UPDATE SET
+            institution_name = excluded.institution_name,
+            encrypted_access_token = excluded.encrypted_access_token
+        """,
+        (item_id, institution_name, encrypted_access_token),
+    )
+    conn.commit()
+    return int(
+        conn.execute(
+            "SELECT id FROM bank_connections WHERE item_id = ?", (item_id,)
+        ).fetchone()[0]
+    )
+
+
+def load_bank_connections(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query(
+        """
+        SELECT id, provider, item_id, institution_name, encrypted_access_token,
+               sync_cursor, last_synced_at
+        FROM bank_connections
+        ORDER BY institution_name, id
+        """,
+        conn,
+    )
+
+
+def apply_bank_sync(
+    conn: sqlite3.Connection,
+    connection_id: int,
+    transactions: pd.DataFrame,
+    removed_external_ids: list[str],
+    next_cursor: str,
+) -> int:
+    before = conn.total_changes
+    for _, row in transactions.iterrows():
+        local_id = hashlib.sha256(
+            f"plaid|{connection_id}|{row['external_id']}".encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            """
+            INSERT INTO transactions (
+                id, date, amount, description, source,
+                bank_connection_id, external_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(bank_connection_id, external_id)
+            WHERE external_id IS NOT NULL
+            DO UPDATE SET
+                date = excluded.date,
+                amount = excluded.amount,
+                description = excluded.description,
+                source = excluded.source
+            """,
+            (
+                local_id,
+                row["date"],
+                float(row["amount"]),
+                row["description"],
+                row["source"],
+                int(connection_id),
+                row["external_id"],
+            ),
+        )
+    if removed_external_ids:
+        placeholders = ",".join("?" for _ in removed_external_ids)
+        conn.execute(
+            f"""
+            DELETE FROM transactions
+            WHERE bank_connection_id = ? AND external_id IN ({placeholders})
+            """,
+            (int(connection_id), *removed_external_ids),
+        )
+    conn.execute(
+        """
+        UPDATE bank_connections
+        SET sync_cursor = ?, last_synced_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (next_cursor, int(connection_id)),
+    )
+    conn.commit()
+    return conn.total_changes - before - 1
+
+
+def delete_bank_connection(conn: sqlite3.Connection, connection_id: int) -> None:
+    conn.execute(
+        "DELETE FROM transactions WHERE bank_connection_id = ?", (connection_id,)
+    )
+    conn.execute("DELETE FROM bank_connections WHERE id = ?", (connection_id,))
+    conn.commit()
 
 
 def add_transaction(

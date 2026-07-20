@@ -6,6 +6,27 @@ Set-Location $ProjectRoot
 $env:Path = "C:\Users\mskis\.local\bin;$env:Path"
 $env:UV_CACHE_DIR = "$ProjectRoot\.uv-cache"
 
+$EnvFile = Join-Path $ProjectRoot ".env"
+if (Test-Path -LiteralPath $EnvFile) {
+    foreach ($Line in Get-Content -LiteralPath $EnvFile) {
+        $TrimmedLine = $Line.Trim()
+        if (-not $TrimmedLine -or $TrimmedLine.StartsWith("#")) {
+            continue
+        }
+
+        $Parts = $TrimmedLine.Split("=", 2)
+        if ($Parts.Count -ne 2) {
+            continue
+        }
+
+        $Name = $Parts[0].Trim()
+        $Value = $Parts[1].Trim().Trim('"').Trim("'")
+        if ($Name -match '^[A-Za-z_][A-Za-z0-9_]*$') {
+            [Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+        }
+    }
+}
+
 $LogDir = Join-Path $ProjectRoot "logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 

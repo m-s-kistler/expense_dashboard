@@ -1,28 +1,42 @@
 from __future__ import annotations
 
 import logging
+import json
 from datetime import date
 from pathlib import Path
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
+from expense_dashboard.bank_sync import (
+    BankSyncError,
+    PlaidClient,
+    PlaidConfig,
+    decrypt_access_token,
+    encrypt_access_token,
+    plaid_transactions_frame,
+)
 from expense_dashboard.categories import CATEGORY_MAP, CATEGORY_TYPES
 from expense_dashboard.db import (
     add_transaction,
     add_obligation,
     apply_category_matches,
+    apply_bank_sync,
     connect,
     delete_obligation,
+    delete_bank_connection,
     init_db,
     ignore_transaction,
     get_setting,
     load_monthly_budgets,
+    load_bank_connections,
     load_obligations,
     load_transactions,
     seed_obligations,
     save_monthly_budgets,
+    save_bank_connection,
     set_transaction_ignored,
     set_setting,
     split_transaction,
@@ -1475,6 +1489,9 @@ def render_debt_paydown(obligations: pd.DataFrame) -> None:
 
 def render_import(conn) -> None:
     st.header("Import")
+    render_bank_connections(conn)
+    st.divider()
+    st.subheader("CSV Import")
     uploaded_files = st.file_uploader(
         "Upload bank CSV files",
         type=["csv"],
@@ -1539,6 +1556,123 @@ def render_import(conn) -> None:
             f"Applied categories to {applied:,} transactions "
             f"from {len(matches):,} confident workbook matches."
         )
+
+
+def render_plaid_link(link_token: str) -> None:
+    token_json = json.dumps(link_token)
+    components.html(
+        f"""
+        <script src="https://cdn.plaid.com/link/v2/stable/link-initialize.js"></script>
+        <div id="status" style="font-family:sans-serif;color:#555">Opening secure bank connection...</div>
+        <script>
+          const handler = Plaid.create({{
+            token: {token_json},
+            onSuccess: (publicToken) => {{
+              const target = new URL(document.referrer);
+              target.searchParams.set("plaid_public_token", publicToken);
+              window.top.location.assign(target.toString());
+            }},
+            onExit: (error) => {{
+              document.getElementById("status").textContent = error
+                ? "Bank connection was not completed."
+                : "Bank connection closed.";
+            }}
+          }});
+          handler.open();
+        </script>
+        """,
+        height=70,
+    )
+
+
+def render_bank_connections(conn) -> None:
+    st.subheader("Connected Banks")
+    st.caption(
+        "Connect through Plaid. Bank credentials are entered only in Plaid Link; "
+        "this app stores an encrypted access token locally."
+    )
+    try:
+        config = PlaidConfig.from_environment()
+    except BankSyncError as exc:
+        st.error(str(exc))
+        return
+
+    if config is None:
+        st.info(
+            "Bank sync is ready but not configured. Set PLAID_CLIENT_ID, "
+            "PLAID_SECRET, and PLAID_TOKEN_ENCRYPTION_KEY, then restart the app."
+        )
+        return
+
+    client = PlaidClient(config)
+    public_token = st.query_params.get("plaid_public_token")
+    if public_token:
+        try:
+            exchanged = client.exchange_public_token(str(public_token))
+            institution_name = client.get_item_name(exchanged["access_token"])
+            save_bank_connection(
+                conn,
+                exchanged["item_id"],
+                institution_name,
+                encrypt_access_token(exchanged["access_token"]),
+            )
+            st.success(f"Connected {institution_name}.")
+        except BankSyncError as exc:
+            st.error(str(exc))
+        finally:
+            del st.query_params["plaid_public_token"]
+
+    if st.button("Connect a bank", key="connect-bank"):
+        try:
+            st.session_state["plaid_link_token"] = client.create_link_token(
+                "expense-dashboard-local-user"
+            )
+        except BankSyncError as exc:
+            st.error(str(exc))
+    link_token = st.session_state.pop("plaid_link_token", None)
+    if link_token:
+        render_plaid_link(link_token)
+
+    connections = load_bank_connections(conn)
+    if connections.empty:
+        st.caption("No banks connected yet.")
+        return
+
+    for _, connection in connections.iterrows():
+        col_name, col_sync, col_remove = st.columns([3, 1, 1])
+        last_sync = (
+            connection["last_synced_at"]
+            if pd.notna(connection["last_synced_at"])
+            else "Never"
+        )
+        col_name.markdown(f"**{connection['institution_name']}**  ")
+        col_name.caption(f"Last synced: {last_sync}")
+        if col_sync.button("Sync", key=f"sync-bank-{connection['id']}"):
+            try:
+                access_token = decrypt_access_token(
+                    connection["encrypted_access_token"]
+                )
+                added, modified, removed, cursor = client.sync_transactions(
+                    access_token, connection["sync_cursor"]
+                )
+                frame = plaid_transactions_frame(
+                    added + modified, connection["institution_name"]
+                )
+                changed = apply_bank_sync(
+                    conn, int(connection["id"]), frame, removed, cursor
+                )
+                st.success(
+                    f"Synced {connection['institution_name']}: "
+                    f"{len(added)} added, {len(modified)} updated, "
+                    f"{len(removed)} removed."
+                )
+                logger.info("Bank sync completed: connection=%s changed=%s", connection["id"], changed)
+            except BankSyncError as exc:
+                st.error(str(exc))
+        if col_remove.button("Disconnect", key=f"remove-bank-{connection['id']}"):
+            delete_bank_connection(conn, int(connection["id"]))
+            st.success(f"Disconnected {connection['institution_name']} and removed its synced transactions.")
+            st.rerun()
 
 
 def render_categorization(
