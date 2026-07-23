@@ -176,6 +176,16 @@ def filter_period(df: pd.DataFrame, period_mode: str, selected_month: str) -> pd
     return df[dates.dt.to_period("M").astype(str) == selected_month]
 
 
+def categorized_transactions(df: pd.DataFrame) -> pd.DataFrame:
+    """Return only fully categorized rows for financial calculations."""
+    if df.empty:
+        return df.copy()
+    return df[
+        df["category_type"].ne("Uncategorized")
+        & df["category"].ne("Uncategorized")
+    ].copy()
+
+
 def resolve_monthly_budgets(
     obligations: pd.DataFrame,
     monthly_budgets: pd.DataFrame,
@@ -183,7 +193,7 @@ def resolve_monthly_budgets(
     selected_month: str,
 ) -> pd.DataFrame:
     resolved = obligations.copy()
-    recurring_types = {"Monthly Bills", "Debt", "Savings"}
+    recurring_types = {"Income", "Monthly Bills", "Debt", "Savings"}
     recurring = resolved["category_type"].isin(recurring_types) & resolved["month"].eq("")
     if not recurring.any() or monthly_budgets.empty:
         return resolved
@@ -221,11 +231,13 @@ def render_monthly_budget_editor(
     key_prefix: str,
 ) -> None:
     editable = obligations[
-        obligations["category_type"].isin(["Monthly Bills", "Debt", "Savings"])
+        obligations["category_type"].isin(
+            ["Income", "Monthly Bills", "Debt", "Savings"]
+        )
         & obligations["month"].eq("")
     ].copy()
     if editable.empty:
-        st.caption("Add monthly bills, debt, or savings items in Setup first.")
+        st.caption("Add income, monthly bills, debt, or savings items in Setup first.")
         return
 
     overrides = monthly_budgets[monthly_budgets["month"].eq(selected_month)].set_index(
@@ -252,7 +264,7 @@ def render_monthly_budget_editor(
             "monthly_amount": st.column_config.NumberColumn(
                 f"{display_month(selected_month)} Budget",
                 min_value=0.0,
-                step=1.0,
+                step=0.01,
                 format="$%.2f",
                 required=True,
             ),
@@ -376,6 +388,7 @@ def budget_summary(
     period_mode: str,
     selected_month: str,
 ) -> dict[str, float]:
+    df = categorized_transactions(df)
     budgeted = period_obligations(obligations, period_mode, selected_month)
     expense_budget = budgeted[budgeted["category_type"] != "Income"]
     income_budget = budgeted[budgeted["category_type"] == "Income"]
@@ -407,6 +420,7 @@ def budget_actuals(
     period_mode: str,
     selected_month: str,
 ) -> pd.DataFrame:
+    df = categorized_transactions(df)
     budgeted = period_obligations(obligations, period_mode, selected_month)
     if budgeted.empty:
         return pd.DataFrame()
@@ -462,12 +476,19 @@ def render_budget_actual_charts(
         var_name="Type",
         value_name="Amount",
     )
+    chart_data["Type"] = chart_data["Type"].str.title()
     chart = (
         alt.Chart(chart_data)
-        .mark_bar()
+        .mark_bar(size=10)
         .encode(
-            x=alt.X("Amount:Q", title="Amount"),
-            y=alt.Y("category:N", sort="-x", title=None),
+            x=alt.X("Amount:Q", title="Amount", stack=None),
+            y=alt.Y(
+                "category:N",
+                sort=alt.EncodingSortField(field="Amount", op="max", order="descending"),
+                title=None,
+                scale=alt.Scale(paddingInner=0.1, paddingOuter=0.05),
+            ),
+            yOffset=alt.YOffset("Type:N", sort=["Budgeted", "Actual"]),
             color=alt.Color("Type:N", legend=alt.Legend(title=None)),
             row=alt.Row("category_type:N", title=None),
             tooltip=[
@@ -477,16 +498,18 @@ def render_budget_actual_charts(
                 alt.Tooltip("Amount:Q", format="$,.2f"),
             ],
         )
-        .properties(height=120)
+        .properties(height=alt.Step(27))
         .resolve_scale(y="independent")
+        .configure_facet(spacing=8)
     )
     st.altair_chart(chart, use_container_width=True)
 
 
 def render_metrics(df: pd.DataFrame, title: str) -> None:
     st.header(title)
-    income = df.loc[df["category_type"] == "Income", "amount"].sum()
-    spending = df.loc[df["category_type"] != "Income", "amount"].sum()
+    financial_df = categorized_transactions(df)
+    income = financial_df.loc[financial_df["category_type"] == "Income", "amount"].sum()
+    spending = financial_df.loc[financial_df["category_type"] != "Income", "amount"].sum()
     net = income - spending
     uncategorized = (df["category_type"] == "Uncategorized").sum()
 
@@ -498,8 +521,9 @@ def render_metrics(df: pd.DataFrame, title: str) -> None:
 
 
 def render_charts(df: pd.DataFrame) -> pd.DataFrame:
+    df = categorized_transactions(df)
     if df.empty:
-        st.info("Import transactions to populate charts.")
+        st.info("Categorize transactions to populate charts.")
         return pd.DataFrame()
 
     by_type = (
@@ -514,57 +538,54 @@ def render_charts(df: pd.DataFrame) -> pd.DataFrame:
         .head(20)
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Spending Breakdown")
-        chart = (
-            alt.Chart(by_type)
-            .mark_arc(innerRadius=55)
-            .encode(
-                theta=alt.Theta("amount:Q"),
-                color=alt.Color("category_type:N", legend=alt.Legend(title=None)),
-                tooltip=["category_type:N", alt.Tooltip("amount:Q", format="$,.2f")],
-            )
-            .properties(height=260)
+    st.subheader("Spending Breakdown")
+    chart = (
+        alt.Chart(by_type)
+        .mark_arc(innerRadius=55)
+        .encode(
+            theta=alt.Theta("amount:Q"),
+            color=alt.Color("category_type:N", legend=alt.Legend(title=None)),
+            tooltip=["category_type:N", alt.Tooltip("amount:Q", format="$,.2f")],
         )
-        st.altair_chart(chart, use_container_width=True)
+        .properties(height=260)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
-    with col2:
-        st.subheader("Top Categories")
-        category_selection = alt.selection_point(
-            fields=["category_type", "category"],
-            name="category_select",
-            empty=False,
+    st.subheader("Top Categories")
+    category_selection = alt.selection_point(
+        fields=["category_type", "category"],
+        name="category_select",
+        empty=False,
+    )
+    chart = (
+        alt.Chart(by_category)
+        .mark_bar()
+        .encode(
+            x=alt.X("amount:Q", title="Amount"),
+            y=alt.Y("category:N", sort="-x", title=None),
+            color=alt.Color("category_type:N", legend=None),
+            opacity=alt.condition(category_selection, alt.value(1), alt.value(0.45)),
+            tooltip=[
+                "category_type:N",
+                "category:N",
+                alt.Tooltip("amount:Q", format="$,.2f"),
+            ],
         )
-        chart = (
-            alt.Chart(by_category)
-            .mark_bar()
-            .encode(
-                x=alt.X("amount:Q", title="Amount"),
-                y=alt.Y("category:N", sort="-x", title=None),
-                color=alt.Color("category_type:N", legend=None),
-                opacity=alt.condition(category_selection, alt.value(1), alt.value(0.45)),
-                tooltip=[
-                    "category_type:N",
-                    "category:N",
-                    alt.Tooltip("amount:Q", format="$,.2f"),
-                ],
-            )
-            .add_params(category_selection)
-            .properties(height=320)
-        )
-        event = st.altair_chart(
-            chart,
-            use_container_width=True,
-            on_select="rerun",
-            selection_mode="category_select",
-            key="top-categories-chart",
-        )
-        selected = selected_chart_category(event)
-        if selected:
-            st.session_state["drilldown"] = selected
-            st.session_state["pending_view"] = "Transactions"
-            st.rerun()
+        .add_params(category_selection)
+        .properties(height=320)
+    )
+    event = st.altair_chart(
+        chart,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="category_select",
+        key="top-categories-chart",
+    )
+    selected = selected_chart_category(event)
+    if selected:
+        st.session_state["drilldown"] = selected
+        st.session_state["pending_view"] = "Transactions"
+        st.rerun()
 
     return by_category
 
@@ -691,7 +712,7 @@ def render_unpaid_panel(
     current_amount = current_col.number_input(
         "Current amount (dollars)",
         min_value=0.0,
-        step=1.0,
+        step=0.01,
         format="%.2f",
         key=widget_key,
         on_change=save_current_amount,
@@ -1228,7 +1249,7 @@ def render_setup(
                     expected_amount = col2.number_input(
                         "Expected amount",
                         min_value=0.0,
-                        step=1.0,
+                        step=0.01,
                         format="%.2f",
                         key=f"add-amount-{category_type}",
                     )
@@ -1239,14 +1260,14 @@ def render_setup(
                         balance = col3.number_input(
                             "Balance",
                             min_value=0.0,
-                            step=100.0,
+                            step=0.01,
                             format="%.2f",
                             key=f"add-balance-{category_type}",
                         )
                         minimum_payment = col2.number_input(
                             "Minimum payment",
                             min_value=0.0,
-                            step=10.0,
+                            step=0.01,
                             format="%.2f",
                             key=f"add-minimum-{category_type}",
                         )
@@ -1336,7 +1357,7 @@ def render_setup(
                         "Expected amount",
                         min_value=0.0,
                         value=float(row["expected_amount"]),
-                        step=1.0,
+                        step=0.01,
                         format="%.2f",
                         key=f"edit-amount-{category_type}-{selected_id}",
                     )
@@ -1348,7 +1369,7 @@ def render_setup(
                             "Balance",
                             min_value=0.0,
                             value=balance,
-                            step=100.0,
+                            step=0.01,
                             format="%.2f",
                             key=f"edit-balance-{category_type}-{selected_id}",
                         )
@@ -1356,7 +1377,7 @@ def render_setup(
                             "Minimum payment",
                             min_value=0.0,
                             value=minimum_payment,
-                            step=10.0,
+                            step=0.01,
                             format="%.2f",
                             key=f"edit-minimum-{category_type}-{selected_id}",
                         )

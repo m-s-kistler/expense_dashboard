@@ -75,6 +75,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_obligations_type_name
             ON obligations(category_type, name);
 
+        CREATE TABLE IF NOT EXISTS deleted_obligations (
+            category_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            month TEXT NOT NULL DEFAULT '',
+            deleted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (category_type, name, month)
+        );
+
         CREATE TABLE IF NOT EXISTS obligation_monthly_budgets (
             obligation_id INTEGER NOT NULL,
             month TEXT NOT NULL,
@@ -677,7 +685,14 @@ def seed_obligations(conn: sqlite3.Connection, obligations: pd.DataFrame) -> int
             interest_rate,
             sort_order
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM deleted_obligations
+            WHERE category_type = ?
+              AND name = ?
+              AND month = ?
+        )
         """,
         [
             (
@@ -690,6 +705,9 @@ def seed_obligations(conn: sqlite3.Connection, obligations: pd.DataFrame) -> int
                 value_or_zero(row, "minimum_payment"),
                 value_or_zero(row, "interest_rate"),
                 int(row["sort_order"] or 0),
+                row["category_type"],
+                row["name"],
+                row["month"] if "month" in row and pd.notna(row["month"]) else "",
             )
             for _, row in obligations.iterrows()
         ],
@@ -804,6 +822,14 @@ def add_obligation(
     minimum_payment: float = 0,
     interest_rate: float = 0,
 ) -> None:
+    normalized_month = month or ""
+    conn.execute(
+        """
+        DELETE FROM deleted_obligations
+        WHERE category_type = ? AND name = ? AND month = ?
+        """,
+        (category_type, name, normalized_month),
+    )
     max_sort_order = conn.execute(
         "SELECT COALESCE(MAX(sort_order), 0) FROM obligations WHERE category_type = ?",
         (category_type,),
@@ -826,7 +852,7 @@ def add_obligation(
         (
             category_type,
             name,
-            month,
+            normalized_month,
             due_day,
             float(expected_amount),
             float(balance),
@@ -897,5 +923,14 @@ def update_obligation_expected_amount(
 
 
 def delete_obligation(conn: sqlite3.Connection, obligation_id: int) -> None:
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO deleted_obligations (category_type, name, month)
+        SELECT category_type, name, month
+        FROM obligations
+        WHERE id = ?
+        """,
+        (obligation_id,),
+    )
     conn.execute("DELETE FROM obligations WHERE id = ?", (obligation_id,))
     conn.commit()
