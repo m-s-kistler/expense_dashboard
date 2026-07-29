@@ -1555,7 +1555,13 @@ def render_import(conn) -> None:
         "Match uncategorized transactions to categorized rows from the Excel workbook "
         "using exact date and amount, plus description similarity."
     )
-    if st.button("Apply categories from workbook"):
+    workbook_available = WORKBOOK_PATH.is_file()
+    if not workbook_available:
+        st.info(
+            f"Optional workbook not found: {WORKBOOK_PATH}. "
+            "Add it to the project folder to use workbook category matching."
+        )
+    if st.button("Apply categories from workbook", disabled=not workbook_available):
         try:
             logger.info("Extracting workbook transactions from %s", WORKBOOK_PATH)
             current_transactions = load_transactions(conn)
@@ -1952,7 +1958,14 @@ def main() -> None:
 
     conn = connect()
     init_db(conn)
-    setup_obligations = extract_setup_obligations(WORKBOOK_PATH)
+    if WORKBOOK_PATH.is_file():
+        setup_obligations = extract_setup_obligations(WORKBOOK_PATH)
+    else:
+        setup_obligations = pd.DataFrame()
+        logger.info(
+            "Optional workbook not found; skipping setup obligation seed: %s",
+            WORKBOOK_PATH,
+        )
     seeded = seed_obligations(conn, setup_obligations)
     if seeded:
         logger.info("Seeded setup obligations from workbook: count=%s", seeded)
@@ -1996,12 +2009,11 @@ def main() -> None:
         ["Monthly", "Full year"],
         default="Monthly",
     )
+    selectable_months = months or [str(pd.Period(date.today(), freq="M"))]
     selected_month = st.sidebar.selectbox(
         "Month",
-        months or ["No transactions"],
-        format_func=lambda value: (
-            display_month(value) if value != "No transactions" else value
-        ),
+        selectable_months,
+        format_func=display_month,
         disabled=period_mode == "Full year" or not months,
     )
     filtered = filter_period(df, period_mode, selected_month)
