@@ -3,8 +3,41 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $ProjectRoot
 
-$env:Path = "C:\Users\mskis\.local\bin;$env:Path"
 $env:UV_CACHE_DIR = "$ProjectRoot\.uv-cache"
+$env:UV_PYTHON_INSTALL_DIR = "$ProjectRoot\.uv-python"
+
+# uv's standalone installer uses this directory by default on Windows. Add it
+# without assuming a particular Windows account name, then resolve the command.
+$UvBinDir = Join-Path $env:USERPROFILE ".local\bin"
+if (Test-Path -LiteralPath $UvBinDir) {
+    $env:Path = "$UvBinDir;$env:Path"
+}
+
+$UvCommand = Get-Command "uv" -ErrorAction SilentlyContinue
+if (-not $UvCommand) {
+    $UvCandidates = @(
+        (Join-Path $UvBinDir "uv.exe"),
+        (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\uv.exe")
+    )
+    $UvExecutable = $UvCandidates |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
+
+    if (-not $UvExecutable) {
+        $WingetPackages = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
+        $UvExecutable = Get-ChildItem -Path $WingetPackages -Filter "uv.exe" -Recurse -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '[\\/]astral-sh\.uv_' } |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+
+    if ($UvExecutable) {
+        $UvCommand = Get-Command $UvExecutable
+    }
+}
+
+if (-not $UvCommand) {
+    throw "uv was not found. Install it with 'winget install --id astral-sh.uv', then run this script again."
+}
 
 $EnvFile = Join-Path $ProjectRoot ".env"
 if (Test-Path -LiteralPath $EnvFile) {
@@ -43,7 +76,7 @@ $env:EXPENSE_DASHBOARD_LOG_FILE = $AppLogFile
 "$(Get-Date -Format o) INFO [launcher] Server log: $ServerLogFile" |
     Out-File -FilePath $LauncherLogFile -Encoding utf8 -Append
 
-& uv run streamlit run app.py `
+& $UvCommand.Source run streamlit run app.py `
     --server.address 0.0.0.0 `
     --server.port 8501 `
     --server.headless true `
