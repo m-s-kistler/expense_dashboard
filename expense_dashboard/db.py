@@ -922,6 +922,25 @@ def update_obligation_expected_amount(
     conn.commit()
 
 
+def update_obligation_sort_orders(
+    conn: sqlite3.Connection,
+    obligation_ids: list[int],
+) -> None:
+    conn.executemany(
+        """
+        UPDATE obligations
+        SET sort_order = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        [
+            (sort_order, int(obligation_id))
+            for sort_order, obligation_id in enumerate(obligation_ids, 1)
+        ],
+    )
+    conn.commit()
+
+
 def delete_obligation(conn: sqlite3.Connection, obligation_id: int) -> None:
     conn.execute(
         """

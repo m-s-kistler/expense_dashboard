@@ -68,6 +68,35 @@ class DashboardCalculationTests(unittest.TestCase):
         income = resolved[resolved["category_type"].eq("Income")].iloc[0]
         self.assertEqual(income["expected_amount"], 1000.0)
 
+    def test_monthly_variable_expense_override_is_used(self):
+        obligations = pd.concat(
+            [
+                self.obligations,
+                pd.DataFrame(
+                    [
+                        {
+                            "id": 3,
+                            "category_type": "Variable Expenses",
+                            "name": "Groceries",
+                            "month": "",
+                            "expected_amount": 300.0,
+                        }
+                    ]
+                ),
+            ],
+            ignore_index=True,
+        )
+        overrides = pd.DataFrame(
+            [{"obligation_id": 3, "month": "2026-07", "expected_amount": 425.0}]
+        )
+
+        resolved = resolve_monthly_budgets(
+            obligations, overrides, "Monthly", "2026-07"
+        )
+
+        groceries = resolved[resolved["name"].eq("Groceries")].iloc[0]
+        self.assertEqual(groceries["expected_amount"], 425.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,11 @@ from datetime import date
 
 import pandas as pd
 
-from expense_dashboard.debt_payoff import add_months, simulate_debt_payoff
+from expense_dashboard.debt_payoff import (
+    add_months,
+    simulate_accelerated_debt_payoff,
+    simulate_debt_payoff,
+)
 
 
 class DebtPayoffTests(unittest.TestCase):
@@ -45,6 +49,42 @@ class DebtPayoffTests(unittest.TestCase):
 
         self.assertEqual(summary.iloc[0]["status"], "Payment below monthly interest")
         self.assertTrue(schedule.empty)
+
+    def test_accelerated_payoff_rolls_paid_debt_budget_forward(self):
+        debts = pd.DataFrame(
+            [
+                {"name": "First", "balance": 100, "expected_amount": 50, "interest_rate": 0},
+                {"name": "Second", "balance": 300, "expected_amount": 50, "interest_rate": 0},
+            ]
+        )
+
+        result, schedule = simulate_accelerated_debt_payoff(
+            debts,
+            extra_payment=50,
+            start_date=date(2026, 1, 1),
+        )
+
+        self.assertEqual(result["months_to_payoff"], 3)
+        self.assertEqual(result["payoff_date"], date(2026, 3, 1))
+        self.assertEqual(schedule["payment"].tolist(), [150.0, 150.0, 100.0])
+        self.assertEqual(schedule.iloc[-1]["ending_balance"], 0.0)
+
+    def test_accelerated_payoff_uses_dataframe_order_as_priority(self):
+        debts = pd.DataFrame(
+            [
+                {"name": "First", "balance": 50, "expected_amount": 0, "interest_rate": 0},
+                {"name": "Second", "balance": 100, "expected_amount": 0, "interest_rate": 0},
+            ]
+        )
+
+        result, schedule = simulate_accelerated_debt_payoff(
+            debts,
+            extra_payment=50,
+            start_date=date(2026, 1, 1),
+        )
+
+        self.assertEqual(result["months_to_payoff"], 3)
+        self.assertEqual(schedule["ending_balance"].tolist(), [100.0, 50.0, 0.0])
 
 
 if __name__ == "__main__":

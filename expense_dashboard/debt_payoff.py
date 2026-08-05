@@ -115,3 +115,108 @@ def simulate_debt_payoff(
         )
 
     return pd.DataFrame(summary_rows), pd.DataFrame(schedule_rows)
+
+
+def simulate_accelerated_debt_payoff(
+    debt_rows: pd.DataFrame,
+    extra_payment: float = 0,
+    start_date: date | None = None,
+    max_months: int = 600,
+) -> tuple[dict[str, object], pd.DataFrame]:
+    """Simulate ordered debt payoff with payment rollover between accounts."""
+    if start_date is None:
+        start_date = date.today().replace(day=1)
+
+    debts = [
+        {
+            "balance": max(float(row.get("balance", 0) or 0), 0),
+            "payment": max(float(row.get("expected_amount", 0) or 0), 0),
+            "rate": max(float(row.get("interest_rate", 0) or 0), 0),
+        }
+        for _, row in debt_rows.iterrows()
+    ]
+    if not debts:
+        return {
+            "months_to_payoff": None,
+            "payoff_date": None,
+            "total_interest": None,
+            "status": "No debts included",
+        }, pd.DataFrame()
+    starting_balance = sum(debt["balance"] for debt in debts)
+    if starting_balance <= 0:
+        return {
+            "months_to_payoff": 0,
+            "payoff_date": start_date,
+            "total_interest": 0.0,
+            "status": "Already paid",
+        }, pd.DataFrame()
+
+    schedule_rows: list[dict[str, object]] = []
+    total_interest = 0.0
+    for month_number in range(1, max_months + 1):
+        opening_balance = sum(debt["balance"] for debt in debts)
+        month_interest = 0.0
+        for debt in debts:
+            if debt["balance"] <= 0:
+                continue
+            interest = debt["balance"] * debt["rate"] / 12
+            debt["balance"] += interest
+            month_interest += interest
+
+        # Every open account receives its normal payment. Payments belonging to
+        # paid accounts, the extra amount, and any unused payment are rolled to
+        # the first open account in priority order.
+        rollover = max(float(extra_payment), 0)
+        month_payment = 0.0
+        for debt in debts:
+            if debt["balance"] <= 0:
+                rollover += debt["payment"]
+                continue
+            payment = min(debt["payment"], debt["balance"])
+            debt["balance"] -= payment
+            month_payment += payment
+            rollover += debt["payment"] - payment
+
+        for debt in debts:
+            if rollover <= 0:
+                break
+            if debt["balance"] <= 0:
+                continue
+            payment = min(rollover, debt["balance"])
+            debt["balance"] -= payment
+            month_payment += payment
+            rollover -= payment
+
+        ending_balance = sum(debt["balance"] for debt in debts)
+        total_interest += month_interest
+        schedule_rows.append(
+            {
+                "name": "Accelerated total",
+                "month": add_months(start_date, month_number - 1),
+                "payment": month_payment,
+                "interest": month_interest,
+                "principal": month_payment - month_interest,
+                "ending_balance": ending_balance,
+            }
+        )
+        if ending_balance <= 0:
+            return {
+                "months_to_payoff": month_number,
+                "payoff_date": add_months(start_date, month_number - 1),
+                "total_interest": total_interest,
+                "status": "Projected",
+            }, pd.DataFrame(schedule_rows)
+        if ending_balance >= opening_balance and month_payment <= month_interest:
+            return {
+                "months_to_payoff": None,
+                "payoff_date": None,
+                "total_interest": None,
+                "status": "Payments below monthly interest",
+            }, pd.DataFrame(schedule_rows)
+
+    return {
+        "months_to_payoff": None,
+        "payoff_date": None,
+        "total_interest": None,
+        "status": f"More than {max_months} months",
+    }, pd.DataFrame(schedule_rows)

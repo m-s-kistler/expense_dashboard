@@ -43,10 +43,14 @@ from expense_dashboard.db import (
     sync_debt_details,
     update_obligation,
     update_obligation_expected_amount,
+    update_obligation_sort_orders,
     update_transaction,
     upsert_transactions,
 )
-from expense_dashboard.debt_payoff import simulate_debt_payoff
+from expense_dashboard.debt_payoff import (
+    simulate_accelerated_debt_payoff,
+    simulate_debt_payoff,
+)
 from expense_dashboard.importer import clean_transaction_file, load_transaction_folder
 from expense_dashboard.logging_config import configure_logging
 from expense_dashboard.matching import match_workbook_categories
@@ -193,7 +197,13 @@ def resolve_monthly_budgets(
     selected_month: str,
 ) -> pd.DataFrame:
     resolved = obligations.copy()
-    recurring_types = {"Income", "Monthly Bills", "Debt", "Savings"}
+    recurring_types = {
+        "Income",
+        "Variable Expenses",
+        "Monthly Bills",
+        "Debt",
+        "Savings",
+    }
     recurring = resolved["category_type"].isin(recurring_types) & resolved["month"].eq("")
     if not recurring.any() or monthly_budgets.empty:
         return resolved
@@ -232,12 +242,15 @@ def render_monthly_budget_editor(
 ) -> None:
     editable = obligations[
         obligations["category_type"].isin(
-            ["Income", "Monthly Bills", "Debt", "Savings"]
+            ["Income", "Variable Expenses", "Monthly Bills", "Debt", "Savings"]
         )
         & obligations["month"].eq("")
     ].copy()
     if editable.empty:
-        st.caption("Add income, monthly bills, debt, or savings items in Setup first.")
+        st.caption(
+            "Add income, variable expenses, monthly bills, debt, or savings "
+            "items in Setup first."
+        )
         return
 
     overrides = monthly_budgets[monthly_budgets["month"].eq(selected_month)].set_index(
@@ -477,32 +490,52 @@ def render_budget_actual_charts(
         value_name="Amount",
     )
     chart_data["Type"] = chart_data["Type"].str.title()
-    chart = (
-        alt.Chart(chart_data)
-        .mark_bar(size=10)
-        .encode(
-            x=alt.X("Amount:Q", title="Amount", stack=None),
-            y=alt.Y(
+    group_order = [
+        group for group in CATEGORY_TYPES
+        if group in chart_data["category_type"].unique()
+    ]
+    group_order.extend(
+        group for group in chart_data["category_type"].unique()
+        if group not in group_order
+    )
+    for group in group_order:
+        group_data = chart_data[chart_data["category_type"].eq(group)]
+        category_sort = (
+            group_data.groupby("category")["Amount"]
+            .max()
+            .sort_values(ascending=False)
+            .index.tolist()
+        )
+        base = alt.Chart(group_data).encode(
+            x=alt.X(
                 "category:N",
-                sort=alt.EncodingSortField(field="Amount", op="max", order="descending"),
+                sort=category_sort,
                 title=None,
-                scale=alt.Scale(paddingInner=0.1, paddingOuter=0.05),
+                axis=alt.Axis(labelAngle=-35, labelLimit=180),
             ),
-            yOffset=alt.YOffset("Type:N", sort=["Budgeted", "Actual"]),
-            color=alt.Color("Type:N", legend=alt.Legend(title=None)),
-            row=alt.Row("category_type:N", title=None),
+            xOffset=alt.XOffset("Type:N", sort=["Budgeted", "Actual"]),
+            y=alt.Y("Amount:Q", title="Amount ($)"),
+            color=alt.Color(
+                "Type:N",
+                sort=["Budgeted", "Actual"],
+                legend=alt.Legend(title=None, orient="top"),
+            ),
             tooltip=[
-                "category_type:N",
                 "category:N",
                 "Type:N",
                 alt.Tooltip("Amount:Q", format="$,.2f"),
             ],
         )
-        .properties(height=alt.Step(27))
-        .resolve_scale(y="independent")
-        .configure_facet(spacing=8)
-    )
-    st.altair_chart(chart, use_container_width=True)
+        bars = base.mark_bar()
+        labels = base.mark_text(dy=-6, fontSize=12).encode(
+            text=alt.Text("Amount:Q", format="$,.0f"),
+            color=alt.value("#333333"),
+        )
+        st.markdown(f"#### {group}")
+        st.altair_chart(
+            (bars + labels).properties(height=320),
+            use_container_width=True,
+        )
 
 
 def render_metrics(df: pd.DataFrame, title: str) -> None:
@@ -520,24 +553,17 @@ def render_metrics(df: pd.DataFrame, title: str) -> None:
     col4.metric("Uncategorized", f"{uncategorized:,}")
 
 
-def render_charts(df: pd.DataFrame) -> pd.DataFrame:
+def render_charts(df: pd.DataFrame) -> None:
     df = categorized_transactions(df)
     if df.empty:
         st.info("Categorize transactions to populate charts.")
-        return pd.DataFrame()
+        return
 
     by_type = (
         df.groupby("category_type", as_index=False)["amount"]
         .sum()
         .sort_values("amount", ascending=False)
     )
-    by_category = (
-        df.groupby(["category_type", "category"], as_index=False)["amount"]
-        .sum()
-        .sort_values("amount", ascending=False)
-        .head(20)
-    )
-
     st.subheader("Spending Breakdown")
     chart = (
         alt.Chart(by_type)
@@ -550,100 +576,6 @@ def render_charts(df: pd.DataFrame) -> pd.DataFrame:
         .properties(height=260)
     )
     st.altair_chart(chart, use_container_width=True)
-
-    st.subheader("Top Categories")
-    category_selection = alt.selection_point(
-        fields=["category_type", "category"],
-        name="category_select",
-        empty=False,
-    )
-    chart = (
-        alt.Chart(by_category)
-        .mark_bar()
-        .encode(
-            x=alt.X("amount:Q", title="Amount"),
-            y=alt.Y("category:N", sort="-x", title=None),
-            color=alt.Color("category_type:N", legend=None),
-            opacity=alt.condition(category_selection, alt.value(1), alt.value(0.45)),
-            tooltip=[
-                "category_type:N",
-                "category:N",
-                alt.Tooltip("amount:Q", format="$,.2f"),
-            ],
-        )
-        .add_params(category_selection)
-        .properties(height=320)
-    )
-    event = st.altair_chart(
-        chart,
-        use_container_width=True,
-        on_select="rerun",
-        selection_mode="category_select",
-        key="top-categories-chart",
-    )
-    selected = selected_chart_category(event)
-    if selected:
-        st.session_state["drilldown"] = selected
-        st.session_state["pending_view"] = "Transactions"
-        st.rerun()
-
-    return by_category
-
-
-def selected_chart_category(event) -> dict[str, str] | None:
-    selection = getattr(event, "selection", None)
-    if selection is None and isinstance(event, dict):
-        selection = event.get("selection")
-    if not selection:
-        return None
-
-    selection_values = (
-        selection.values()
-        if isinstance(selection, dict)
-        else [selection]
-    )
-    for value in selection_values:
-        if isinstance(value, list) and value:
-            point = value[0]
-        elif isinstance(value, dict):
-            point = value
-        else:
-            continue
-
-        category_type = point.get("category_type")
-        category = point.get("category")
-        if category_type and category:
-            return {
-                "category_type": category_type,
-                "category": category,
-            }
-    return None
-
-
-def render_category_drilldown(by_category: pd.DataFrame) -> None:
-    if by_category.empty:
-        return
-
-    st.subheader("Drill Down")
-    cols = st.columns(4)
-    for index, row in by_category.head(12).reset_index(drop=True).iterrows():
-        label = f"{row['category']} (${row['amount']:,.0f})"
-        if cols[index % 4].button(label, key=f"drilldown-{index}-{row['category']}"):
-            st.session_state["drilldown"] = {
-                "category_type": row["category_type"],
-                "category": row["category"],
-            }
-            st.session_state["view"] = "Transactions"
-            st.rerun()
-
-    if st.session_state.get("drilldown"):
-        active = st.session_state["drilldown"]
-        st.caption(
-            f"Active transaction filter: {active['category_type']} / {active['category']}"
-        )
-        if st.button("Clear transaction filter"):
-            st.session_state.pop("drilldown", None)
-            st.rerun()
 
 
 def render_unpaid_panel(
@@ -1417,7 +1349,7 @@ def render_setup(
                     st.rerun()
 
 
-def render_debt_paydown(obligations: pd.DataFrame) -> None:
+def render_debt_paydown(conn, obligations: pd.DataFrame) -> None:
     st.header("Debt Paydown")
     debt_rows = obligations[
         obligations["category_type"].eq("Debt")
@@ -1428,7 +1360,23 @@ def render_debt_paydown(obligations: pd.DataFrame) -> None:
         st.info("Add debt balances in Setup to calculate payoff dates.")
         return
 
+    extra_payment = float(get_setting(conn, "debt_payoff_extra_payment", "0") or 0)
+    try:
+        excluded_ids = {
+            int(value)
+            for value in json.loads(
+                get_setting(conn, "debt_payoff_excluded_ids", "[]") or "[]"
+            )
+        }
+    except (TypeError, ValueError, json.JSONDecodeError):
+        excluded_ids = set()
+
     summary, schedule = simulate_debt_payoff(debt_rows)
+    included_debts = debt_rows[~debt_rows["id"].isin(excluded_ids)].copy()
+    accelerated, accelerated_schedule = simulate_accelerated_debt_payoff(
+        included_debts,
+        extra_payment,
+    )
     total_balance = summary["balance"].sum()
     total_budgeted_payment = summary["budgeted_payment"].sum()
     projected = summary[summary["months_to_payoff"].notna()]
@@ -1441,54 +1389,141 @@ def render_debt_paydown(obligations: pd.DataFrame) -> None:
 
     st.subheader("Payoff Projection")
     display = summary.copy()
+    display.insert(0, "id", debt_rows["id"].astype(int).tolist())
+    display.insert(1, "priority", range(1, len(display) + 1))
+    display.insert(2, "exclude", display["id"].isin(excluded_ids))
     display["payoff_date"] = pd.to_datetime(display["payoff_date"]).dt.strftime("%Y-%m")
     display["interest_rate"] = display["interest_rate"] * 100
-    st.dataframe(
-        display[
-            [
-                "name",
-                "balance",
-                "budgeted_payment",
-                "minimum_payment",
-                "interest_rate",
+    projection_columns = [
+        "id",
+        "priority",
+        "exclude",
+        "name",
+        "balance",
+        "budgeted_payment",
+        "minimum_payment",
+        "interest_rate",
+        "months_to_payoff",
+        "payoff_date",
+        "total_interest",
+        "status",
+    ]
+    with st.form("payoff-projection-editor"):
+        extra_col, payoff_col = st.columns(2)
+        edited_extra_payment = extra_col.number_input(
+            "Extra monthly debt payment",
+            min_value=0.0,
+            value=extra_payment,
+            step=25.0,
+            format="%.2f",
+            help=(
+                "Applied to the first included debt, then rolled forward with "
+                "each paid-off account's budgeted payment."
+            ),
+        )
+        payoff_date = accelerated["payoff_date"]
+        payoff_col.metric(
+            "Accelerated payoff date",
+            (
+                payoff_date.strftime("%B %Y")
+                if payoff_date
+                else str(accelerated["status"])
+            ),
+            help="Save changes to recalculate this date after editing the payment or table.",
+        )
+        st.caption(
+            "Edit Priority to control payoff order. Excluded accounts keep their "
+            "individual projection but are omitted from the accelerated total."
+        )
+        edited = st.data_editor(
+            display[projection_columns],
+            use_container_width=True,
+            hide_index=True,
+            disabled=[
+                "id",
                 "months_to_payoff",
                 "payoff_date",
                 "total_interest",
                 "status",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "name": "Debt",
-            "balance": st.column_config.NumberColumn("Balance", format="$%.2f"),
-            "budgeted_payment": st.column_config.NumberColumn(
-                "Budgeted Payment",
-                format="$%.2f",
-            ),
-            "minimum_payment": st.column_config.NumberColumn(
-                "Minimum",
-                format="$%.2f",
-            ),
-            "interest_rate": st.column_config.NumberColumn(
-                "Interest Rate",
-                format="%.2f%%",
-            ),
-            "months_to_payoff": "Months",
-            "payoff_date": "Payoff Month",
-            "total_interest": st.column_config.NumberColumn(
-                "Interest",
-                format="$%.2f",
-            ),
-            "status": "Status",
-        },
-    )
+            ],
+            column_config={
+                "id": None,
+                "priority": st.column_config.NumberColumn(
+                    "Priority", min_value=1, step=1, required=True
+                ),
+                "exclude": st.column_config.CheckboxColumn(
+                    "Exclude", default=False
+                ),
+                "name": st.column_config.TextColumn("Debt", required=True),
+                "balance": st.column_config.NumberColumn(
+                    "Balance", min_value=0.0, format="$%.2f", required=True
+                ),
+                "budgeted_payment": st.column_config.NumberColumn(
+                    "Budgeted Payment", min_value=0.0, format="$%.2f", required=True
+                ),
+                "minimum_payment": st.column_config.NumberColumn(
+                    "Minimum", min_value=0.0, format="$%.2f", required=True
+                ),
+                "interest_rate": st.column_config.NumberColumn(
+                    "Interest Rate", min_value=0.0, format="%.2f%%", required=True
+                ),
+                "months_to_payoff": "Months",
+                "payoff_date": "Payoff Month",
+                "total_interest": st.column_config.NumberColumn(
+                    "Interest", format="$%.2f"
+                ),
+                "status": "Status",
+            },
+            key="payoff-projection-table",
+        )
+        save_projection = st.form_submit_button("Save changes", type="primary")
 
-    if schedule.empty:
+    if save_projection:
+        source_by_id = obligations.set_index("id")
+        for row in edited.to_dict("records"):
+            obligation_id = int(row["id"])
+            source = source_by_id.loc[obligation_id]
+            update_obligation(
+                conn,
+                obligation_id,
+                "Debt",
+                str(row["name"]).strip(),
+                source["month"],
+                int(source["due_day"]) if pd.notna(source["due_day"]) else None,
+                float(row["budgeted_payment"]),
+                float(row["balance"]),
+                float(row["minimum_payment"]),
+                float(row["interest_rate"]) / 100,
+            )
+        ordered_rows = sorted(
+            edited.to_dict("records"),
+            key=lambda row: (int(row["priority"]), int(row["id"])),
+        )
+        update_obligation_sort_orders(
+            conn,
+            [int(row["id"]) for row in ordered_rows],
+        )
+        saved_excluded_ids = [
+            int(row["id"]) for row in edited.to_dict("records") if row["exclude"]
+        ]
+        set_setting(conn, "debt_payoff_extra_payment", str(edited_extra_payment))
+        set_setting(
+            conn,
+            "debt_payoff_excluded_ids",
+            json.dumps(saved_excluded_ids),
+        )
+        logger.info("Updated debt payoff projection rows: count=%s", len(edited))
+        st.success("Payoff projection updated.")
+        st.rerun()
+
+    if schedule.empty and accelerated_schedule.empty:
         return
 
     st.subheader("Balance Over Time")
-    chart_data = schedule.copy()
+    chart_data = pd.concat(
+        [schedule, accelerated_schedule],
+        ignore_index=True,
+    )
     chart_data["month"] = pd.to_datetime(chart_data["month"])
     chart = (
         alt.Chart(chart_data)
@@ -1497,6 +1532,16 @@ def render_debt_paydown(obligations: pd.DataFrame) -> None:
             x=alt.X("month:T", title="Month"),
             y=alt.Y("ending_balance:Q", title="Balance"),
             color=alt.Color("name:N", legend=alt.Legend(title=None)),
+            strokeWidth=alt.condition(
+                alt.datum.name == "Accelerated total",
+                alt.value(4),
+                alt.value(2),
+            ),
+            strokeDash=alt.condition(
+                alt.datum.name == "Accelerated total",
+                alt.value([8, 4]),
+                alt.value([1, 0]),
+            ),
             tooltip=[
                 "name:N",
                 alt.Tooltip("month:T", title="Month"),
@@ -2063,7 +2108,7 @@ def main() -> None:
             selected_month,
         )
     elif view == "Debt Paydown":
-        render_debt_paydown(obligations)
+        render_debt_paydown(conn, obligations)
     elif view == "Import":
         render_import(conn)
     elif view == "Categorize":
