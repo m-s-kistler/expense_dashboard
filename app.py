@@ -9,6 +9,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from expense_dashboard.auth import require_login
 
 from expense_dashboard.bank_sync import (
     BankSyncError,
@@ -2630,6 +2631,7 @@ def render_transactions(
 
 
 def main() -> None:
+    require_login()
     logger.info("Handling Streamlit rerun")
     apply_responsive_styles()
     if st.session_state.get("pending_view"):
