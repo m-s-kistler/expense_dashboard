@@ -76,8 +76,24 @@ $env:EXPENSE_DASHBOARD_LOG_FILE = $AppLogFile
 "$(Get-Date -Format o) INFO [launcher] Server log: $ServerLogFile" |
     Out-File -FilePath $LauncherLogFile -Encoding utf8 -Append
 
-& $UvCommand.Source run streamlit run app.py `
-    --server.address 0.0.0.0 `
-    --server.port 8501 `
-    --server.headless true `
-    --browser.gatherUsageStats false *>> $ServerLogFile
+# Windows PowerShell converts output written by native programs to stderr into
+# PowerShell error records. With ErrorActionPreference set to Stop, routine uv
+# status messages (for example, "Using CPython ...") would terminate this
+# script even though uv itself had not failed.
+$PreviousErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
+    & $UvCommand.Source run streamlit run app.py `
+        --server.address 0.0.0.0 `
+        --server.port 8501 `
+        --server.headless true `
+        --browser.gatherUsageStats false *>> $ServerLogFile
+    $UvExitCode = $LASTEXITCODE
+}
+finally {
+    $ErrorActionPreference = $PreviousErrorActionPreference
+}
+
+if ($UvExitCode -ne 0) {
+    throw "Finance Dashboard exited with code $UvExitCode. See $ServerLogFile for details."
+}

@@ -111,9 +111,107 @@ def init_db(conn: sqlite3.Connection) -> None:
             last_synced_at TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        CREATE TABLE IF NOT EXISTS income_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            owner TEXT NOT NULL DEFAULT '',
+            schedule_type TEXT NOT NULL CHECK (
+                schedule_type IN ('semi_monthly', 'biweekly')
+            ),
+            expected_amount REAL NOT NULL DEFAULT 0,
+            semi_monthly_day_1 INTEGER,
+            semi_monthly_day_2 INTEGER,
+            biweekly_anchor_date TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS paycheck_occurrences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            income_source_id INTEGER NOT NULL,
+            scheduled_date TEXT NOT NULL,
+            actual_date TEXT,
+            expected_amount REAL NOT NULL DEFAULT 0,
+            actual_amount REAL,
+            matched_transaction_id TEXT,
+            is_manual INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'planned' CHECK (
+                status IN ('planned', 'received', 'skipped')
+            ),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(income_source_id, scheduled_date),
+            FOREIGN KEY (income_source_id) REFERENCES income_sources(id) ON DELETE CASCADE,
+            FOREIGN KEY (matched_transaction_id) REFERENCES transactions(id) ON DELETE SET NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_paycheck_occurrences_date
+            ON paycheck_occurrences(scheduled_date);
+
+        CREATE TABLE IF NOT EXISTS obligation_funding_rules (
+            obligation_id INTEGER PRIMARY KEY,
+            income_source_id INTEGER NOT NULL,
+            timing_rule TEXT NOT NULL DEFAULT 'previous_paycheck' CHECK (
+                timing_rule IN (
+                    'previous_paycheck',
+                    'previous_month_second',
+                    'same_month_first',
+                    'same_month_second'
+                )
+            ),
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (obligation_id) REFERENCES obligations(id) ON DELETE CASCADE,
+            FOREIGN KEY (income_source_id) REFERENCES income_sources(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS paycheck_allocations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            paycheck_occurrence_id INTEGER NOT NULL,
+            obligation_id INTEGER NOT NULL,
+            budget_month TEXT NOT NULL,
+            due_date TEXT,
+            allocated_amount REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'planned' CHECK (
+                status IN ('planned', 'partial', 'paid', 'skipped')
+            ),
+            note TEXT NOT NULL DEFAULT '',
+            is_manual INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(paycheck_occurrence_id, obligation_id, budget_month),
+            FOREIGN KEY (paycheck_occurrence_id) REFERENCES paycheck_occurrences(id) ON DELETE CASCADE,
+            FOREIGN KEY (obligation_id) REFERENCES obligations(id) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_paycheck_allocations_month
+            ON paycheck_allocations(budget_month);
+
+        CREATE TABLE IF NOT EXISTS allocation_transactions (
+            allocation_id INTEGER NOT NULL,
+            transaction_id TEXT NOT NULL,
+            applied_amount REAL NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (allocation_id, transaction_id),
+            FOREIGN KEY (allocation_id) REFERENCES paycheck_allocations(id) ON DELETE CASCADE,
+            FOREIGN KEY (transaction_id) REFERENCES transactions(id) ON DELETE CASCADE
+        );
         """
     )
+    _ensure_paycheck_columns(conn)
     conn.commit()
+
+
+def _ensure_paycheck_columns(conn: sqlite3.Connection) -> None:
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(paycheck_occurrences)").fetchall()
+    }
+    if "is_manual" not in columns:
+        conn.execute(
+            "ALTER TABLE paycheck_occurrences ADD COLUMN is_manual INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _ensure_transaction_columns(conn: sqlite3.Connection) -> None:
@@ -952,4 +1050,446 @@ def delete_obligation(conn: sqlite3.Connection, obligation_id: int) -> None:
         (obligation_id,),
     )
     conn.execute("DELETE FROM obligations WHERE id = ?", (obligation_id,))
+    conn.commit()
+
+
+def seed_default_income_sources(conn: sqlite3.Connection) -> int:
+    """Create the household's two editable paycheck schedules once."""
+    before = conn.total_changes
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO income_sources (
+            name, owner, schedule_type, expected_amount,
+            semi_monthly_day_1, semi_monthly_day_2, biweekly_anchor_date
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            ("Wells Fargo", "Me", "semi_monthly", 5800.0, 1, 15, None),
+            ("Corning", "Kelly", "biweekly", 2700.0, None, None, "2026-08-21"),
+        ],
+    )
+    inserted = conn.total_changes - before
+    defaults_applied = conn.execute(
+        "SELECT 1 FROM app_settings WHERE key = 'paycheck_default_amounts_v1'"
+    ).fetchone()
+    if not defaults_applied:
+        conn.executemany(
+            """
+            UPDATE income_sources SET expected_amount = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE name = ? AND expected_amount = 0
+            """,
+            [(5800.0, "Wells Fargo"), (2700.0, "Corning")],
+        )
+        conn.execute(
+            """
+            UPDATE paycheck_occurrences
+            SET expected_amount = (
+                    SELECT expected_amount FROM income_sources
+                    WHERE income_sources.id = paycheck_occurrences.income_source_id
+                ),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE expected_amount = 0 AND status = 'planned'
+            """
+        )
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('paycheck_default_amounts_v1', 'applied')"
+        )
+    conn.commit()
+    return inserted
+
+
+def load_income_sources(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query(
+        """
+        SELECT id, name, owner, schedule_type, expected_amount,
+               semi_monthly_day_1, semi_monthly_day_2,
+               biweekly_anchor_date, active
+        FROM income_sources
+        ORDER BY active DESC, id
+        """,
+        conn,
+    )
+
+
+def save_income_source(
+    conn: sqlite3.Connection,
+    source_id: int,
+    name: str,
+    owner: str,
+    schedule_type: str,
+    expected_amount: float,
+    semi_monthly_day_1: int | None,
+    semi_monthly_day_2: int | None,
+    biweekly_anchor_date: str | None,
+    active: bool,
+) -> None:
+    conn.execute(
+        """
+        UPDATE income_sources
+        SET name = ?, owner = ?, schedule_type = ?, expected_amount = ?,
+            semi_monthly_day_1 = ?, semi_monthly_day_2 = ?,
+            biweekly_anchor_date = ?, active = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            name.strip(), owner.strip(), schedule_type, float(expected_amount),
+            semi_monthly_day_1, semi_monthly_day_2, biweekly_anchor_date,
+            int(active), int(source_id),
+        ),
+    )
+    conn.execute(
+        """
+        UPDATE paycheck_occurrences
+        SET expected_amount = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE income_source_id = ? AND status = 'planned' AND is_manual = 0
+        """,
+        (float(expected_amount), int(source_id)),
+    )
+    conn.commit()
+
+
+def generate_paycheck_occurrences(
+    conn: sqlite3.Connection,
+    start_date: str,
+    end_date: str,
+) -> int:
+    from datetime import date
+
+    from expense_dashboard.paychecks import generate_paycheck_dates
+
+    sources = load_income_sources(conn)
+    before = conn.total_changes
+    for _, source in sources[sources["active"].astype(bool)].iterrows():
+        source_dict = source.where(pd.notna(source), None).to_dict()
+        dates = generate_paycheck_dates(
+            source_dict, date.fromisoformat(start_date), date.fromisoformat(end_date)
+        )
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO paycheck_occurrences (
+                income_source_id, scheduled_date, expected_amount
+            ) VALUES (?, ?, ?)
+            """,
+            [
+                (int(source["id"]), occurrence.isoformat(), float(source["expected_amount"]))
+                for occurrence in dates
+            ],
+        )
+    conn.commit()
+    return conn.total_changes - before
+
+
+def load_paycheck_occurrences(
+    conn: sqlite3.Connection,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    clauses: list[str] = []
+    params: list[str] = []
+    if start_date:
+        clauses.append("p.scheduled_date >= ?")
+        params.append(start_date)
+    if end_date:
+        clauses.append("p.scheduled_date <= ?")
+        params.append(end_date)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    return pd.read_sql_query(
+        f"""
+        SELECT p.id, p.income_source_id, s.name AS source_name, s.owner,
+               p.scheduled_date, p.actual_date, p.expected_amount,
+               p.actual_amount, p.matched_transaction_id, p.status, p.is_manual
+        FROM paycheck_occurrences p
+        JOIN income_sources s ON s.id = p.income_source_id
+        {where}
+        ORDER BY COALESCE(p.actual_date, p.scheduled_date), p.id
+        """,
+        conn,
+        params=params,
+    )
+
+
+def update_paycheck_occurrence(
+    conn: sqlite3.Connection,
+    occurrence_id: int,
+    actual_date: str | None,
+    expected_amount: float,
+    actual_amount: float | None,
+    status: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE paycheck_occurrences
+        SET actual_date = ?, expected_amount = ?, actual_amount = ?, status = ?,
+            is_manual = 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (actual_date, float(expected_amount), actual_amount, status, int(occurrence_id)),
+    )
+    conn.commit()
+
+
+def link_paycheck_transaction(
+    conn: sqlite3.Connection,
+    occurrence_id: int,
+    transaction_id_value: str,
+) -> None:
+    transaction = conn.execute(
+        "SELECT date, amount FROM transactions WHERE id = ?",
+        (transaction_id_value,),
+    ).fetchone()
+    if not transaction:
+        raise ValueError("Income transaction was not found.")
+    conn.execute(
+        """
+        UPDATE paycheck_occurrences
+        SET actual_date = ?, actual_amount = ?, matched_transaction_id = ?,
+            status = 'received', is_manual = 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (transaction["date"], float(transaction["amount"]), transaction_id_value, int(occurrence_id)),
+    )
+    conn.commit()
+
+
+def load_funding_rules(conn: sqlite3.Connection) -> pd.DataFrame:
+    return pd.read_sql_query(
+        """
+        SELECT r.obligation_id, r.income_source_id, r.timing_rule,
+               s.name AS source_name
+        FROM obligation_funding_rules r
+        JOIN income_sources s ON s.id = r.income_source_id
+        ORDER BY r.obligation_id
+        """,
+        conn,
+    )
+
+
+def save_funding_rule(
+    conn: sqlite3.Connection,
+    obligation_id: int,
+    income_source_id: int,
+    timing_rule: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO obligation_funding_rules (
+            obligation_id, income_source_id, timing_rule, updated_at
+        ) VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(obligation_id) DO UPDATE SET
+            income_source_id = excluded.income_source_id,
+            timing_rule = excluded.timing_rule,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (int(obligation_id), int(income_source_id), timing_rule),
+    )
+    conn.commit()
+
+
+def seed_default_funding_rules(conn: sqlite3.Connection) -> int:
+    """Fill only missing rules using the household's stated funding pattern."""
+    sources = {
+        row["name"]: int(row["id"])
+        for row in conn.execute("SELECT id, name FROM income_sources").fetchall()
+    }
+    wells_fargo_id = sources.get("Wells Fargo")
+    corning_id = sources.get("Corning")
+    if not wells_fargo_id or not corning_id:
+        return 0
+    before = conn.total_changes
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO obligation_funding_rules (
+            obligation_id, income_source_id, timing_rule
+        )
+        SELECT id,
+               CASE WHEN category_type = 'Variable Expenses' THEN ? ELSE ? END,
+               CASE
+                   WHEN lower(name) LIKE '%best egg%' THEN 'previous_month_second'
+                   ELSE 'previous_paycheck'
+               END
+        FROM obligations
+        WHERE category_type IN (
+            'Variable Expenses', 'Monthly Bills', 'Debt', 'Savings', 'Non-Monthly Bills'
+        )
+        """,
+        (corning_id, wells_fargo_id),
+    )
+    conn.commit()
+    return conn.total_changes - before
+
+
+def refresh_legacy_paycheck_suggestions(conn: sqlite3.Connection) -> int:
+    """Remove only untouched v1 suggestions so improved rules can regenerate them."""
+    migration_key = "paycheck_suggestions_v3"
+    if conn.execute(
+        "SELECT 1 FROM app_settings WHERE key = ?", (migration_key,)
+    ).fetchone():
+        return 0
+    before = conn.total_changes
+    conn.execute("DELETE FROM paycheck_allocations WHERE is_manual = 0")
+    removed = conn.total_changes - before
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?, 'applied')",
+        (migration_key,),
+    )
+    conn.commit()
+    return removed
+
+
+def load_paycheck_allocations(
+    conn: sqlite3.Connection,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> pd.DataFrame:
+    clauses: list[str] = []
+    params: list[str] = []
+    if start_date:
+        clauses.append("p.scheduled_date >= ?")
+        params.append(start_date)
+    if end_date:
+        clauses.append("p.scheduled_date <= ?")
+        params.append(end_date)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    return pd.read_sql_query(
+        f"""
+        SELECT a.id, a.paycheck_occurrence_id, a.obligation_id,
+               a.budget_month, a.due_date, a.allocated_amount, a.status,
+               a.note, a.is_manual, o.name AS obligation_name,
+               o.category_type, p.scheduled_date, s.name AS source_name,
+               COALESCE(SUM(at.applied_amount), 0) AS paid_amount
+        FROM paycheck_allocations a
+        JOIN obligations o ON o.id = a.obligation_id
+        JOIN paycheck_occurrences p ON p.id = a.paycheck_occurrence_id
+        JOIN income_sources s ON s.id = p.income_source_id
+        LEFT JOIN allocation_transactions at ON at.allocation_id = a.id
+        {where}
+        GROUP BY a.id
+        ORDER BY p.scheduled_date, o.category_type, o.sort_order, o.name
+        """,
+        conn,
+        params=params,
+    )
+
+
+def upsert_paycheck_allocation(
+    conn: sqlite3.Connection,
+    paycheck_occurrence_id: int,
+    obligation_id: int,
+    budget_month: str,
+    due_date: str | None,
+    allocated_amount: float,
+    status: str = "planned",
+    note: str = "",
+    is_manual: bool = True,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO paycheck_allocations (
+            paycheck_occurrence_id, obligation_id, budget_month, due_date,
+            allocated_amount, status, note, is_manual
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(paycheck_occurrence_id, obligation_id, budget_month) DO UPDATE SET
+            due_date = excluded.due_date,
+            allocated_amount = excluded.allocated_amount,
+            status = excluded.status,
+            note = excluded.note,
+            is_manual = MAX(paycheck_allocations.is_manual, excluded.is_manual),
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (
+            int(paycheck_occurrence_id), int(obligation_id), budget_month, due_date,
+            float(allocated_amount), status, note.strip(), int(is_manual),
+        ),
+    )
+    conn.commit()
+
+
+def update_paycheck_allocation(
+    conn: sqlite3.Connection,
+    allocation_id: int,
+    paycheck_occurrence_id: int,
+    allocated_amount: float,
+    status: str,
+    note: str,
+) -> None:
+    current = conn.execute(
+        "SELECT paycheck_occurrence_id, obligation_id, budget_month FROM paycheck_allocations WHERE id = ?",
+        (int(allocation_id),),
+    ).fetchone()
+    if not current:
+        raise ValueError("Allocation was not found.")
+    duplicate = conn.execute(
+        """
+        SELECT id, allocated_amount FROM paycheck_allocations
+        WHERE paycheck_occurrence_id = ? AND obligation_id = ? AND budget_month = ?
+          AND id <> ?
+        """,
+        (
+            int(paycheck_occurrence_id), int(current["obligation_id"]),
+            current["budget_month"], int(allocation_id),
+        ),
+    ).fetchone()
+    if duplicate:
+        conn.execute(
+            """
+            UPDATE paycheck_allocations
+            SET allocated_amount = ?, status = ?, note = ?, is_manual = 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                float(duplicate["allocated_amount"]) + float(allocated_amount),
+                status, note.strip(), int(duplicate["id"]),
+            ),
+        )
+        conn.execute("DELETE FROM paycheck_allocations WHERE id = ?", (int(allocation_id),))
+        conn.commit()
+        return
+    conn.execute(
+        """
+        UPDATE paycheck_allocations
+        SET paycheck_occurrence_id = ?, allocated_amount = ?, status = ?, note = ?,
+            is_manual = 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (int(paycheck_occurrence_id), float(allocated_amount), status, note.strip(), int(allocation_id)),
+    )
+    conn.commit()
+
+
+def delete_paycheck_allocation(conn: sqlite3.Connection, allocation_id: int) -> None:
+    conn.execute("DELETE FROM paycheck_allocations WHERE id = ?", (int(allocation_id),))
+    conn.commit()
+
+
+def link_allocation_transaction(
+    conn: sqlite3.Connection,
+    allocation_id: int,
+    transaction_id_value: str,
+    applied_amount: float,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO allocation_transactions (allocation_id, transaction_id, applied_amount)
+        VALUES (?, ?, ?)
+        ON CONFLICT(allocation_id, transaction_id) DO UPDATE SET
+            applied_amount = excluded.applied_amount
+        """,
+        (int(allocation_id), transaction_id_value, float(applied_amount)),
+    )
+    allocated, paid = conn.execute(
+        """
+        SELECT a.allocated_amount, COALESCE(SUM(at.applied_amount), 0)
+        FROM paycheck_allocations a
+        LEFT JOIN allocation_transactions at ON at.allocation_id = a.id
+        WHERE a.id = ? GROUP BY a.id
+        """,
+        (int(allocation_id),),
+    ).fetchone()
+    status = "paid" if paid >= allocated else ("partial" if paid > 0 else "planned")
+    conn.execute(
+        "UPDATE paycheck_allocations SET status = ?, is_manual = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (status, int(allocation_id)),
+    )
     conn.commit()

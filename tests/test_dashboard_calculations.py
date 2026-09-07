@@ -6,6 +6,9 @@ from app import (
     budget_actuals,
     budget_summary,
     categorized_transactions,
+    chart_transactions,
+    filter_period,
+    monthly_category_comparison,
     resolve_monthly_budgets,
 )
 
@@ -41,6 +44,22 @@ class DashboardCalculationTests(unittest.TestCase):
         rent = actuals[actuals["category"].eq("Rent")].iloc[0]
         self.assertEqual(rent["actual"], 200.0)
 
+    def test_chart_transactions_match_actual_bar_and_selected_period(self):
+        transactions = pd.DataFrame([
+            {"date": "2026-07-01", "amount": 200.0, "category_type": "Monthly Bills", "category": "Rent"},
+            {"date": "2026-07-02", "amount": -20.0, "category_type": "Monthly Bills", "category": "Rent"},
+            {"date": "2026-06-01", "amount": 300.0, "category_type": "Monthly Bills", "category": "Rent"},
+            {"date": "2026-07-01", "amount": 50.0, "category_type": "Income", "category": "Rent"},
+            {"date": "2026-07-01", "amount": 25.0, "category_type": "Monthly Bills", "category": "Uncategorized"},
+        ])
+        period = filter_period(transactions, "Monthly", "2026-07")
+        rows = chart_transactions(period, "Monthly Bills", "Rent")
+        actuals = budget_actuals(period, self.obligations, "Monthly", "2026-07")
+        self.assertEqual(rows["amount"].tolist(), [200.0, -20.0])
+        self.assertEqual(rows["amount"].sum(), actuals.loc[actuals["category"].eq("Rent"), "actual"].iloc[0])
+        self.assertTrue(chart_transactions(period, "Monthly Bills", "Missing").empty)
+        self.assertEqual(chart_transactions(transactions, "Monthly Bills", "Rent")["amount"].sum(), 480.0)
+
     def test_monthly_income_override_is_used(self):
         overrides = pd.DataFrame(
             [{"obligation_id": 1, "month": "2026-07", "expected_amount": 1250.0}]
@@ -52,6 +71,33 @@ class DashboardCalculationTests(unittest.TestCase):
 
         income = resolved[resolved["category_type"].eq("Income")].iloc[0]
         self.assertEqual(income["expected_amount"], 1250.0)
+
+    def test_monthly_comparison_fills_gaps_and_resolves_each_budget(self):
+        transactions = self.transactions.copy()
+        transactions["date"] = "2026-12-05"
+        overrides = pd.DataFrame([
+            {"obligation_id": 2, "month": "2027-01", "expected_amount": 600.0},
+            {"obligation_id": 2, "month": "2027-02", "expected_amount": 0.0},
+        ])
+        result = monthly_category_comparison(
+            transactions, self.obligations, overrides, "Monthly Bills", "Rent",
+            ["2026-12", "2027-01", "2027-02"],
+        )
+        self.assertEqual(result["actual"].tolist(), [200.0, 0.0, 0.0])
+        self.assertEqual(result["budgeted"].tolist(), [500.0, 600.0, 0.0])
+
+    def test_monthly_comparison_applies_non_monthly_budget_only_when_due(self):
+        obligations = pd.DataFrame([
+            {"id": 3, "category_type": "Non-Monthly Bills", "name": "Insurance", "month": "January", "expected_amount": 900.0},
+        ])
+        transactions = self.transactions.copy()
+        transactions["date"] = "2027-01-05"
+        result = monthly_category_comparison(
+            transactions, obligations, pd.DataFrame(), "Non-Monthly Bills", "Insurance",
+            ["2026-12", "2027-01", "2027-02"],
+        )
+        self.assertEqual(result["budgeted"].tolist(), [0.0, 900.0, 0.0])
+        self.assertEqual(result["actual"].tolist(), [0.0, 0.0, 0.0])
 
     def test_full_year_income_uses_monthly_overrides_and_defaults(self):
         overrides = pd.DataFrame(

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import logging
 import json
-from datetime import date
+import logging
+from datetime import date, timedelta
 from pathlib import Path
 
 import altair as alt
@@ -20,23 +20,36 @@ from expense_dashboard.bank_sync import (
 )
 from expense_dashboard.categories import CATEGORY_MAP, CATEGORY_TYPES
 from expense_dashboard.db import (
-    add_transaction,
     add_obligation,
+    add_transaction,
     apply_category_matches,
     apply_bank_sync,
     connect,
-    delete_obligation,
     delete_bank_connection,
+    delete_obligation,
+    delete_paycheck_allocation,
+    generate_paycheck_occurrences,
+    get_setting,
     init_db,
     ignore_transaction,
-    get_setting,
-    load_monthly_budgets,
     load_bank_connections,
+    load_funding_rules,
+    load_income_sources,
+    load_monthly_budgets,
     load_obligations,
+    load_paycheck_allocations,
+    load_paycheck_occurrences,
     load_transactions,
-    seed_obligations,
-    save_monthly_budgets,
+    link_allocation_transaction,
+    link_paycheck_transaction,
     save_bank_connection,
+    save_funding_rule,
+    save_income_source,
+    save_monthly_budgets,
+    refresh_legacy_paycheck_suggestions,
+    seed_default_income_sources,
+    seed_default_funding_rules,
+    seed_obligations,
     set_transaction_ignored,
     set_setting,
     split_transaction,
@@ -44,7 +57,10 @@ from expense_dashboard.db import (
     update_obligation,
     update_obligation_expected_amount,
     update_obligation_sort_orders,
+    update_paycheck_allocation,
+    update_paycheck_occurrence,
     update_transaction,
+    upsert_paycheck_allocation,
     upsert_transactions,
 )
 from expense_dashboard.debt_payoff import (
@@ -54,6 +70,7 @@ from expense_dashboard.debt_payoff import (
 from expense_dashboard.importer import clean_transaction_file, load_transaction_folder
 from expense_dashboard.logging_config import configure_logging
 from expense_dashboard.matching import match_workbook_categories
+from expense_dashboard.paychecks import choose_funding_paycheck, due_date_for_month
 from expense_dashboard.workbook import (
     MONTH_SHEETS,
     WORKBOOK_PATH,
@@ -471,6 +488,51 @@ def render_budget_summary(
     col4.metric("Total Spent", f"${summary['total_spent']:,.2f}")
 
 
+def chart_transactions(df: pd.DataFrame, category_type: str, category: str) -> pd.DataFrame:
+    """Use the same rows as the actual bar, within the already filtered period."""
+    rows = categorized_transactions(df)
+    return rows[rows["category_type"].eq(category_type) & rows["category"].eq(category)].copy()
+
+
+def queue_chart_transactions(key: str) -> None:
+    selection = st.session_state[key]["selection"].get("transaction_bar", [])
+    if selection:
+        st.session_state["pending_chart_transactions"] = selection[0]
+
+
+def reset_chart_selection() -> None:
+    # Fresh chart widgets let the same bar be clicked again after dismissal.
+    st.session_state["chart_selection_revision"] = st.session_state.get("chart_selection_revision", 0) + 1
+
+
+@st.dialog("Transactions", width="large", on_dismiss=reset_chart_selection)
+def show_chart_transactions(df: pd.DataFrame, selected: dict) -> None:
+    rows = chart_transactions(df, selected["category_type"], selected["category"])
+    st.subheader(f"{selected['category_type']} / {selected['category']}")
+    if selected["Type"] == "Budgeted":
+        st.caption(
+            f"Budgeted: ${selected['Amount']:,.2f}. This is a planned amount; "
+            "the transactions below make up the actual total."
+        )
+    st.caption(f"Selected period · {len(rows):,} transactions · Total: ${rows['amount'].sum():,.2f}")
+    if rows.empty:
+        st.info("No transactions in this category for the selected period.")
+        return
+    rows = rows.sort_values("date", ascending=False)
+    st.dataframe(
+        rows[["date", "description", "amount", "source", "notes"]],
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "date": st.column_config.DateColumn("Date"),
+            "description": "Description",
+            "amount": st.column_config.NumberColumn("Amount", format="$%.2f"),
+            "source": "Source",
+            "notes": "Notes",
+        },
+    )
+
+
 def render_budget_actual_charts(
     df: pd.DataFrame,
     obligations: pd.DataFrame,
@@ -483,6 +545,7 @@ def render_budget_actual_charts(
         return
 
     st.subheader("Budgeted vs. Actual")
+    st.caption("Click a bar to see transactions for that category in the selected period.")
     chart_data = comparison.melt(
         id_vars=["category_type", "category"],
         value_vars=["budgeted", "actual"],
@@ -514,7 +577,11 @@ def render_budget_actual_charts(
                 axis=alt.Axis(labelAngle=-35, labelLimit=180),
             ),
             xOffset=alt.XOffset("Type:N", sort=["Budgeted", "Actual"]),
-            y=alt.Y("Amount:Q", title="Amount ($)"),
+            y=alt.Y(
+                "Amount:Q",
+                title="Amount ($)",
+                axis=alt.Axis(format="$,.0f", labelLimit=0, labelPadding=6, titlePadding=12),
+            ),
             color=alt.Color(
                 "Type:N",
                 sort=["Budgeted", "Actual"],
@@ -526,16 +593,149 @@ def render_budget_actual_charts(
                 alt.Tooltip("Amount:Q", format="$,.2f"),
             ],
         )
-        bars = base.mark_bar()
+        selection = alt.selection_point(
+            name="transaction_bar",
+            fields=["category_type", "category", "Type", "Amount"],
+            on="click",
+            toggle=False,
+            clear=False,
+        )
+        bars = base.mark_bar(cursor="pointer").add_params(selection)
         labels = base.mark_text(dy=-6, fontSize=12).encode(
             text=alt.Text("Amount:Q", format="$,.0f"),
             color=alt.value("#333333"),
         )
+        chart = bars + labels
+        if group == "Variable Expenses":
+            totals = (
+                group_data.groupby("Type", as_index=False)["Amount"]
+                .sum()
+            )
+            total_lines = alt.Chart(totals).mark_rule(strokeWidth=2).encode(
+                y=alt.Y(
+                    "Amount:Q",
+                    title="Total Amount ($)",
+                    axis=alt.Axis(
+                        orient="right", format="$,.0f", labelLimit=0,
+                        labelPadding=6, titlePadding=12,
+                    ),
+                ),
+                color=alt.Color(
+                    "Type:N",
+                    sort=["Budgeted", "Actual"],
+                    legend=alt.Legend(title=None, orient="top"),
+                ),
+                strokeDash=alt.StrokeDash(
+                    "Type:N",
+                    sort=["Budgeted", "Actual"],
+                    legend=alt.Legend(title="Total lines", orient="top"),
+                ),
+                tooltip=[
+                    alt.Tooltip("Type:N", title="Total"),
+                    alt.Tooltip("Amount:Q", title="Amount", format="$,.2f"),
+                ],
+            )
+            # Keep bars and their labels on one axis; only totals need a second axis.
+            chart = alt.layer(chart, total_lines).resolve_scale(y="independent")
         st.markdown(f"#### {group}")
+        chart_key = f"budget-bar-{period_mode}-{selected_month}-{group}-{st.session_state.get('chart_selection_revision', 0)}"
         st.altair_chart(
-            (bars + labels).properties(height=320),
+            chart.properties(
+                height=320,
+                autosize=alt.AutoSizeParams(type="fit", contains="padding", resize=True),
+                padding={"left": 15, "right": 15, "top": 10, "bottom": 10},
+            ),
             use_container_width=True,
+            key=chart_key,
+            on_select=lambda key=chart_key: queue_chart_transactions(key),
+            selection_mode="transaction_bar",
         )
+    selected = st.session_state.pop("pending_chart_transactions", None)
+    if selected:
+        show_chart_transactions(df, selected)
+
+
+def monthly_category_comparison(
+    df: pd.DataFrame,
+    obligations: pd.DataFrame,
+    monthly_budgets: pd.DataFrame,
+    category_type: str,
+    category: str,
+    months: list[str],
+) -> pd.DataFrame:
+    rows = chart_transactions(df, category_type, category)
+    actuals = rows.groupby(pd.to_datetime(rows["date"]).dt.to_period("M"))["amount"].sum()
+    records = []
+    for month in months:
+        resolved = resolve_monthly_budgets(obligations, monthly_budgets, "Monthly", month)
+        budget = period_obligations(resolved, "Monthly", month)
+        matching = budget[budget["category_type"].eq(category_type) & budget["name"].eq(category)]
+        budget_amount = matching["period_expected"].sum() if not matching.empty else 0.0
+        records.append({
+            "month": month,
+            "category_type": category_type,
+            "category": category,
+            "actual": float(actuals.get(pd.Period(month, freq="M"), 0.0)),
+            "budgeted": float(budget_amount),
+        })
+    return pd.DataFrame(records)
+
+
+def render_monthly_comparison(
+    df: pd.DataFrame,
+    obligations: pd.DataFrame,
+    monthly_budgets: pd.DataFrame,
+    selected_month: str,
+) -> None:
+    st.subheader("Monthly category comparison")
+    st.caption("Compare across months independently of the Dashboard period. Actual amounts are bars; budgets are a line.")
+    pairs = pd.concat([
+        categorized_transactions(df)[["category_type", "category"]],
+        obligations[["category_type", "name"]].rename(columns={"name": "category"}),
+    ]).dropna().drop_duplicates()
+    if pairs.empty:
+        st.info("Add categories or categorized transactions to compare months.")
+        return
+    left, right = st.columns(2)
+    group = left.selectbox("Category", sorted(pairs["category_type"].unique()), key="monthly-comparison-type")
+    category = right.selectbox(
+        "Sub-category", sorted(pairs.loc[pairs["category_type"].eq(group), "category"].unique()),
+        key=f"monthly-comparison-category-{group}",
+    )
+    anchor = pd.Period(selected_month, freq="M")
+    history = [pd.Period(month, freq="M") for month in month_options(df)]
+    available = pd.period_range(min([anchor - 11, *history]), max([anchor, *history]), freq="M").astype(str).tolist()
+    left, right = st.columns(2)
+    start = left.selectbox("From month", available, index=max(0, len(available) - 12), format_func=display_month, key="monthly-comparison-start")
+    end_options = available[available.index(start):]
+    end = right.selectbox("Through month", end_options, index=len(end_options) - 1, format_func=display_month, key="monthly-comparison-end")
+    months = pd.period_range(start, end, freq="M").astype(str).tolist()
+    comparison = monthly_category_comparison(df, obligations, monthly_budgets, group, category, months)
+    series = comparison.melt(id_vars=["month", "category_type", "category"], value_vars=["actual", "budgeted"], var_name="Type", value_name="Amount")
+    series["Type"] = series["Type"].str.title()
+    base = alt.Chart(series).encode(
+        x=alt.X("month:O", sort=months, title="Month", axis=alt.Axis(labelAngle=-35)),
+        y=alt.Y("Amount:Q", title="Amount ($)", axis=alt.Axis(format="$,.0f", labelLimit=0, titlePadding=12)),
+        color=alt.Color("Type:N", scale=alt.Scale(domain=["Actual", "Budgeted"], range=["#4c78a8", "#f58518"]), legend=alt.Legend(title=None, orient="top")),
+        tooltip=[alt.Tooltip("month:O", title="Month"), "Type:N", alt.Tooltip("Amount:Q", format="$,.2f")],
+    )
+    selection = alt.selection_point(name="transaction_bar", fields=["month", "category_type", "category", "Type", "Amount"], on="click", toggle=False, clear=False)
+    bars = base.transform_filter(alt.datum.Type == "Actual").mark_bar(cursor="pointer").add_params(selection)
+    line = base.transform_filter(alt.datum.Type == "Budgeted").mark_line(point=True, strokeWidth=3)
+    key = f"monthly-comparison-{group}-{category}-{start}-{end}-{st.session_state.get('chart_selection_revision', 0)}"
+    st.altair_chart(
+        (bars + line).properties(
+            height=340,
+            autosize=alt.AutoSizeParams(type="fit", contains="padding", resize=True),
+            padding={"left": 15, "right": 15, "top": 15, "bottom": 15},
+        ),
+        use_container_width=True, key=key,
+        on_select=lambda: queue_chart_transactions(key), selection_mode="transaction_bar",
+    )
+    st.caption("Click an actual bar to see that month's transactions. Months without transactions show $0.")
+    selected = st.session_state.pop("pending_chart_transactions", None)
+    if selected:
+        show_chart_transactions(filter_period(df, "Monthly", selected["month"]), selected)
 
 
 def render_metrics(df: pd.DataFrame, title: str) -> None:
@@ -1056,6 +1256,437 @@ def render_split_editor(
             st.rerun()
 
 
+def paycheck_window(selected_month: str) -> tuple[date, date]:
+    period = pd.Period(selected_month, freq="M")
+    start = (period - 1).start_time.date()
+    end = (period + 1).end_time.date()
+    return start, end
+
+
+def suggest_month_allocations(
+    conn,
+    obligations: pd.DataFrame,
+    selected_month: str,
+) -> int:
+    """Create missing suggestions; existing/manual allocations are never replaced."""
+    rules = load_funding_rules(conn)
+    if rules.empty:
+        return 0
+    start, end = paycheck_window(selected_month)
+    paychecks = load_paycheck_occurrences(conn, start.isoformat(), end.isoformat())
+    if paychecks.empty:
+        return 0
+    existing = load_paycheck_allocations(conn)
+    existing_keys = (
+        set(zip(existing["obligation_id"].astype(int), existing["budget_month"]))
+        if not existing.empty
+        else set()
+    )
+    month_obligations = period_obligations(obligations, "Monthly", selected_month)
+    month_obligations = month_obligations[
+        ~month_obligations["category_type"].eq("Income")
+    ]
+    rule_lookup = rules.set_index("obligation_id")
+    created = 0
+    for _, obligation in month_obligations.iterrows():
+        obligation_id = int(obligation["id"])
+        if (obligation_id, selected_month) in existing_keys or obligation_id not in rule_lookup.index:
+            continue
+        rule = rule_lookup.loc[obligation_id]
+        eligible = paychecks[
+            paychecks["income_source_id"].eq(int(rule["income_source_id"]))
+            & ~paychecks["status"].eq("skipped")
+        ]
+        if obligation["category_type"] == "Variable Expenses":
+            month_checks = eligible[eligible["scheduled_date"].str.startswith(selected_month)]
+            if month_checks.empty:
+                continue
+            total_amount = round(float(obligation["period_expected"]), 2)
+            per_check = round(total_amount / len(month_checks), 2)
+            remaining = total_amount
+            for position, (_, occurrence) in enumerate(month_checks.iterrows()):
+                amount = remaining if position == len(month_checks) - 1 else per_check
+                upsert_paycheck_allocation(
+                    conn,
+                    int(occurrence["id"]),
+                    obligation_id,
+                    selected_month,
+                    None,
+                    amount,
+                    is_manual=False,
+                )
+                remaining = round(remaining - amount, 2)
+                created += 1
+            continue
+        due = due_date_for_month(selected_month, obligation.get("due_day"))
+        if due is None:
+            in_month = eligible[eligible["scheduled_date"].str.startswith(selected_month)]
+            chosen_date = (
+                date.fromisoformat(str(in_month.iloc[0]["scheduled_date"]))
+                if not in_month.empty
+                else None
+            )
+        else:
+            chosen_date = choose_funding_paycheck(
+                [date.fromisoformat(value) for value in eligible["scheduled_date"]],
+                due,
+                str(rule["timing_rule"]),
+            )
+        if chosen_date is None:
+            continue
+        occurrence = eligible[eligible["scheduled_date"].eq(chosen_date.isoformat())]
+        if occurrence.empty:
+            continue
+        upsert_paycheck_allocation(
+            conn,
+            int(occurrence.iloc[0]["id"]),
+            obligation_id,
+            selected_month,
+            due.isoformat() if due else None,
+            float(obligation["period_expected"]),
+            is_manual=False,
+        )
+        created += 1
+    return created
+
+
+def render_paycheck_setup(conn, obligations: pd.DataFrame) -> None:
+    st.subheader("Paycheck schedules")
+    st.caption(
+        "Schedules generate planning occurrences; individual dates and amounts remain editable."
+    )
+    sources = load_income_sources(conn)
+    for _, source in sources.iterrows():
+        source_id = int(source["id"])
+        with st.expander(f"{source['name']} - {source['owner']}"):
+            with st.form(f"income-source-{source_id}"):
+                col1, col2 = st.columns(2)
+                name = col1.text_input("Source name", value=str(source["name"]))
+                owner = col2.text_input("Owner", value=str(source["owner"]))
+                schedule_type = st.selectbox(
+                    "Schedule",
+                    ["semi_monthly", "biweekly"],
+                    index=0 if source["schedule_type"] == "semi_monthly" else 1,
+                    format_func=lambda value: value.replace("_", " ").title(),
+                )
+                expected_amount = st.number_input(
+                    "Expected net paycheck",
+                    min_value=0.0,
+                    value=float(source["expected_amount"]),
+                    step=25.0,
+                    format="%.2f",
+                )
+                day1 = int(source["semi_monthly_day_1"]) if pd.notna(source["semi_monthly_day_1"]) else 1
+                day2 = int(source["semi_monthly_day_2"]) if pd.notna(source["semi_monthly_day_2"]) else 15
+                anchor_value = (
+                    date.fromisoformat(str(source["biweekly_anchor_date"]))
+                    if pd.notna(source["biweekly_anchor_date"]) and source["biweekly_anchor_date"]
+                    else date.today()
+                )
+                if schedule_type == "semi_monthly":
+                    col1, col2 = st.columns(2)
+                    day1 = int(col1.number_input("First pay day", 1, 31, day1))
+                    day2 = int(col2.number_input("Second pay day", 1, 31, day2))
+                else:
+                    anchor_value = st.date_input("Known payday anchor", value=anchor_value)
+                active = st.checkbox("Active", value=bool(source["active"]))
+                saved = st.form_submit_button("Save schedule")
+            if saved:
+                save_income_source(
+                    conn,
+                    source_id,
+                    name,
+                    owner,
+                    schedule_type,
+                    expected_amount,
+                    day1 if schedule_type == "semi_monthly" else None,
+                    day2 if schedule_type == "semi_monthly" else None,
+                    anchor_value.isoformat() if schedule_type == "biweekly" else None,
+                    active,
+                )
+                st.success("Paycheck schedule saved.")
+                st.rerun()
+
+    st.subheader("Expense funding rules")
+    st.caption(
+        "These rules suggest a paycheck for new monthly plans. Moving an item later creates a manual override."
+    )
+    expense_rows = obligations[
+        obligations["category_type"].isin(
+            ["Variable Expenses", "Monthly Bills", "Debt", "Savings", "Non-Monthly Bills"]
+        )
+    ].copy()
+    rules = load_funding_rules(conn)
+    rule_map = rules.set_index("obligation_id").to_dict("index") if not rules.empty else {}
+    source_options = {int(row["id"]): str(row["name"]) for _, row in sources.iterrows()}
+    timing_options = {
+        "previous_paycheck": "Latest paycheck on/before due date",
+        "previous_month_second": "Second paycheck in prior month",
+        "same_month_first": "First paycheck in due month",
+        "same_month_second": "Second paycheck in due month",
+    }
+    if not expense_rows.empty and source_options:
+        choices = {
+            int(row["id"]): f"{row['category_type']} - {row['name']}"
+            for _, row in expense_rows.iterrows()
+        }
+        selected_id = st.selectbox("Expense", list(choices), format_func=choices.get)
+        current = rule_map.get(selected_id, {})
+        source_ids = list(source_options)
+        current_source = int(current.get("income_source_id", source_ids[0]))
+        with st.form("funding-rule-form"):
+            source_id = st.selectbox(
+                "Paid from",
+                source_ids,
+                index=source_ids.index(current_source) if current_source in source_ids else 0,
+                format_func=source_options.get,
+            )
+            current_timing = str(current.get("timing_rule", "previous_paycheck"))
+            timing_rule = st.selectbox(
+                "Funding timing",
+                list(timing_options),
+                index=list(timing_options).index(current_timing),
+                format_func=timing_options.get,
+            )
+            rule_saved = st.form_submit_button("Save funding rule")
+        if rule_saved:
+            save_funding_rule(conn, selected_id, source_id, timing_rule)
+            st.success("Funding rule saved.")
+            st.rerun()
+
+
+def render_paycheck_plan(
+    conn,
+    obligations: pd.DataFrame,
+    selected_month: str,
+    all_transactions: pd.DataFrame,
+) -> None:
+    st.header(f"Paycheck Plan - {display_month(selected_month)}")
+    st.caption("Plan by funding paycheck while keeping due dates and budget months intact.")
+    start, end = paycheck_window(selected_month)
+    generate_paycheck_occurrences(conn, start.isoformat(), end.isoformat())
+    suggest_month_allocations(conn, obligations, selected_month)
+    paychecks = load_paycheck_occurrences(conn, start.isoformat(), end.isoformat())
+    allocations = load_paycheck_allocations(conn, start.isoformat(), end.isoformat())
+    if paychecks.empty:
+        st.info("Configure an active paycheck schedule in Setup to begin planning.")
+        return
+
+    unassigned = period_obligations(obligations, "Monthly", selected_month)
+    unassigned = unassigned[~unassigned["category_type"].eq("Income")]
+    assigned_ids = set(
+        allocations.loc[allocations["budget_month"].eq(selected_month), "obligation_id"].astype(int)
+    ) if not allocations.empty else set()
+    unassigned = unassigned[~unassigned["id"].isin(assigned_ids)]
+    summary_allocations = allocations[allocations["budget_month"].eq(selected_month)]
+    funding_paycheck_ids = set(summary_allocations["paycheck_occurrence_id"].astype(int)) if not summary_allocations.empty else set()
+    relevant_paychecks = paychecks[
+        paychecks["scheduled_date"].str.startswith(selected_month)
+        | paychecks["id"].isin(funding_paycheck_ids)
+    ]
+    total_income = float(relevant_paychecks["expected_amount"].sum())
+    total_allocated = float(summary_allocations["allocated_amount"].sum()) if not summary_allocations.empty else 0.0
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Expected income", f"${total_income:,.2f}")
+    col2.metric("Allocated", f"${total_allocated:,.2f}")
+    col3.metric("Available", f"${total_income - total_allocated:,.2f}")
+    col4.metric("Unassigned", f"{len(unassigned):,}")
+    if total_allocated > total_income:
+        st.error(f"This planning window is overallocated by ${total_allocated - total_income:,.2f}.")
+
+    paycheck_labels = {
+        int(row["id"]): f"{row['scheduled_date']} - {row['source_name']}"
+        for _, row in paychecks.iterrows()
+    }
+    for _, paycheck in paychecks.iterrows():
+        occurrence_id = int(paycheck["id"])
+        rows = allocations[allocations["paycheck_occurrence_id"].eq(occurrence_id)]
+        allocated = float(rows["allocated_amount"].sum()) if not rows.empty else 0.0
+        expected = float(paycheck["expected_amount"])
+        with st.expander(
+            f"{paycheck['scheduled_date']} | {paycheck['source_name']} | "
+            f"${allocated:,.2f} allocated | ${expected - allocated:,.2f} remaining",
+            expanded=paycheck["scheduled_date"][:7] == selected_month,
+        ):
+            with st.form(f"paycheck-edit-{occurrence_id}"):
+                col1, col2, col3, col4 = st.columns(4)
+                actual_date_value = (
+                    date.fromisoformat(str(paycheck["actual_date"]))
+                    if pd.notna(paycheck["actual_date"]) and paycheck["actual_date"]
+                    else date.fromisoformat(str(paycheck["scheduled_date"]))
+                )
+                actual_date = col1.date_input("Actual date", value=actual_date_value)
+                expected_edit = col2.number_input("Expected", min_value=0.0, value=expected, step=25.0)
+                actual_edit = col3.number_input(
+                    "Actual received",
+                    min_value=0.0,
+                    value=float(paycheck["actual_amount"] or 0),
+                    step=25.0,
+                )
+                status = col4.selectbox(
+                    "Status", ["planned", "received", "skipped"],
+                    index=["planned", "received", "skipped"].index(paycheck["status"]),
+                )
+                paycheck_saved = st.form_submit_button("Save paycheck")
+            if paycheck_saved:
+                update_paycheck_occurrence(
+                    conn, occurrence_id, actual_date.isoformat(), expected_edit,
+                    actual_edit if actual_edit else None, status,
+                )
+                st.rerun()
+
+            if pd.isna(paycheck["matched_transaction_id"]) or not paycheck["matched_transaction_id"]:
+                income_candidates = all_transactions[
+                    all_transactions["category_type"].eq("Income")
+                    & ~all_transactions["excluded"].astype(bool)
+                ].copy()
+                if not income_candidates.empty:
+                    income_labels = {
+                        str(row["id"]): f"{row['date']} - {row['description']} - ${float(row['amount']):,.2f}"
+                        for _, row in income_candidates.iterrows()
+                    }
+                    with st.form(f"paycheck-income-match-{occurrence_id}"):
+                        income_transaction_id = st.selectbox(
+                            "Match received income",
+                            list(income_labels),
+                            format_func=income_labels.get,
+                        )
+                        income_linked = st.form_submit_button("Match income transaction")
+                    if income_linked:
+                        link_paycheck_transaction(conn, occurrence_id, income_transaction_id)
+                        st.rerun()
+            else:
+                st.caption("Received income is matched to a transaction.")
+
+            if rows.empty:
+                st.caption("No expenses assigned.")
+            else:
+                st.dataframe(
+                    rows[["category_type", "obligation_name", "budget_month", "due_date", "allocated_amount", "paid_amount", "status"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "allocated_amount": st.column_config.NumberColumn("Allocated", format="$%.2f"),
+                        "paid_amount": st.column_config.NumberColumn("Paid", format="$%.2f"),
+                    },
+                )
+
+    st.subheader("Adjust an allocation")
+    if allocations.empty:
+        st.caption("No allocations yet.")
+    else:
+        allocation_labels = {
+            int(row["id"]): f"{row['obligation_name']} ({row['budget_month']}, ${row['allocated_amount']:,.2f})"
+            for _, row in allocations.iterrows()
+        }
+        allocation_id = st.selectbox("Allocation", list(allocation_labels), format_func=allocation_labels.get)
+        allocation = allocations[allocations["id"].eq(allocation_id)].iloc[0]
+        with st.form("allocation-edit-form"):
+            target_id = st.selectbox(
+                "Funding paycheck", list(paycheck_labels),
+                index=list(paycheck_labels).index(int(allocation["paycheck_occurrence_id"])),
+                format_func=paycheck_labels.get,
+            )
+            amount = st.number_input("Allocated amount", min_value=0.0, value=float(allocation["allocated_amount"]), step=10.0)
+            allocation_status = st.selectbox(
+                "Status", ["planned", "partial", "paid", "skipped"],
+                index=["planned", "partial", "paid", "skipped"].index(allocation["status"]),
+            )
+            note = st.text_input("Note", value=str(allocation["note"] or ""))
+            col1, col2 = st.columns(2)
+            allocation_saved = col1.form_submit_button("Save allocation")
+            allocation_deleted = col2.form_submit_button("Remove allocation")
+        if allocation_saved:
+            update_paycheck_allocation(conn, allocation_id, target_id, amount, allocation_status, note)
+            st.rerun()
+        if allocation_deleted:
+            delete_paycheck_allocation(conn, allocation_id)
+            st.rerun()
+
+        other_paychecks = {
+            key: value for key, value in paycheck_labels.items()
+            if key != int(allocation["paycheck_occurrence_id"])
+        }
+        if other_paychecks and float(allocation["allocated_amount"]) > 0:
+            with st.expander("Split across another paycheck"):
+                with st.form("allocation-split-form"):
+                    split_target_id = st.selectbox(
+                        "Additional paycheck",
+                        list(other_paychecks),
+                        format_func=other_paychecks.get,
+                    )
+                    split_amount = st.number_input(
+                        "Amount to move",
+                        min_value=0.01,
+                        max_value=float(allocation["allocated_amount"]),
+                        value=min(25.0, float(allocation["allocated_amount"])),
+                        step=5.0,
+                    )
+                    split_saved = st.form_submit_button("Split allocation")
+                if split_saved:
+                    update_paycheck_allocation(
+                        conn,
+                        allocation_id,
+                        int(allocation["paycheck_occurrence_id"]),
+                        float(allocation["allocated_amount"]) - split_amount,
+                        str(allocation["status"]),
+                        str(allocation["note"] or ""),
+                    )
+                    upsert_paycheck_allocation(
+                        conn,
+                        split_target_id,
+                        int(allocation["obligation_id"]),
+                        str(allocation["budget_month"]),
+                        str(allocation["due_date"]) if pd.notna(allocation["due_date"]) else None,
+                        split_amount,
+                        note="Split allocation",
+                        is_manual=True,
+                    )
+                    st.rerun()
+
+        st.subheader("Apply a transaction")
+        candidates = all_transactions[
+            all_transactions["category_type"].eq(allocation["category_type"])
+            & all_transactions["category"].eq(allocation["obligation_name"])
+            & ~all_transactions["excluded"].astype(bool)
+        ].copy()
+        if candidates.empty:
+            st.caption("No categorized transaction matches this expense yet.")
+        else:
+            candidate_labels = {
+                str(row["id"]): f"{row['date']} - {row['description']} - ${float(row['amount']):,.2f}"
+                for _, row in candidates.iterrows()
+            }
+            with st.form("allocation-transaction-form"):
+                transaction_id_value = st.selectbox("Transaction", list(candidate_labels), format_func=candidate_labels.get)
+                transaction_amount = float(candidates[candidates["id"].eq(transaction_id_value)].iloc[0]["amount"])
+                applied_amount = st.number_input("Amount applied", min_value=0.01, value=min(transaction_amount, float(allocation["allocated_amount"])), step=0.01)
+                linked = st.form_submit_button("Apply transaction")
+            if linked:
+                link_allocation_transaction(conn, allocation_id, transaction_id_value, applied_amount)
+                st.rerun()
+
+    if not unassigned.empty:
+        st.subheader("Unassigned expenses")
+        unassigned_labels = {
+            int(row["id"]): f"{row['category_type']} - {row['name']} (${row['period_expected']:,.2f})"
+            for _, row in unassigned.iterrows()
+        }
+        with st.form("assign-expense-form"):
+            obligation_id = st.selectbox("Expense", list(unassigned_labels), format_func=unassigned_labels.get)
+            target_id = st.selectbox("Paycheck", list(paycheck_labels), format_func=paycheck_labels.get)
+            selected_row = unassigned[unassigned["id"].eq(obligation_id)].iloc[0]
+            assign_amount = st.number_input("Amount", min_value=0.0, value=float(selected_row["period_expected"]), step=10.0)
+            assigned = st.form_submit_button("Assign expense")
+        if assigned:
+            due = due_date_for_month(selected_month, selected_row.get("due_day"))
+            upsert_paycheck_allocation(
+                conn, target_id, obligation_id, selected_month,
+                due.isoformat() if due else None, assign_amount, is_manual=True,
+            )
+            st.rerun()
+
+
 def render_setup(
     conn,
     obligations: pd.DataFrame,
@@ -1075,9 +1706,12 @@ def render_setup(
     col1.metric("Left to Budget", f"${summary['left_to_budget']:,.2f}")
     col2.metric("Total Budgeted", f"${summary['total_budgeted']:,.2f}")
 
+    with st.expander("Paycheck planning setup", expanded=False):
+        render_paycheck_setup(conn, obligations)
+
     if period_mode == "Monthly":
         with st.expander(
-            f"Monthly budget amounts — {display_month(selected_month)}",
+            f"Monthly budget amounts - {display_month(selected_month)}",
             expanded=True,
         ):
             st.caption(
@@ -2003,6 +2637,8 @@ def main() -> None:
 
     conn = connect()
     init_db(conn)
+    seed_default_income_sources(conn)
+    refresh_legacy_paycheck_suggestions(conn)
     if WORKBOOK_PATH.is_file():
         setup_obligations = extract_setup_obligations(WORKBOOK_PATH)
     else:
@@ -2014,6 +2650,7 @@ def main() -> None:
     seeded = seed_obligations(conn, setup_obligations)
     if seeded:
         logger.info("Seeded setup obligations from workbook: count=%s", seeded)
+    seed_default_funding_rules(conn)
     obligations = load_obligations(conn)
     monthly_budgets = load_monthly_budgets(conn)
     debt_details_missing = (
@@ -2037,6 +2674,7 @@ def main() -> None:
             "View",
             [
                 "Dashboard",
+                "Paycheck Plan",
                 "Setup",
                 "Debt Paydown",
                 "Import",
@@ -2081,7 +2719,7 @@ def main() -> None:
         )
         if period_mode == "Monthly":
             with st.expander(
-                f"Edit monthly budgets — {display_month(selected_month)}"
+                f"Edit monthly budgets - {display_month(selected_month)}"
             ):
                 render_monthly_budget_editor(
                     conn,
@@ -2094,9 +2732,34 @@ def main() -> None:
             conn, filtered, period_mode, effective_obligations, selected_month
         )
         render_charts(filtered)
+        render_monthly_comparison(df, obligations, monthly_budgets, selected_month)
         render_budget_actual_charts(
             filtered, effective_obligations, period_mode, selected_month
         )
+        if period_mode == "Monthly":
+            start, end = paycheck_window(selected_month)
+            plan_rows = load_paycheck_allocations(conn, start.isoformat(), end.isoformat())
+            plan_rows = plan_rows[plan_rows["budget_month"].eq(selected_month)] if not plan_rows.empty else plan_rows
+            st.subheader("Paycheck funding")
+            if plan_rows.empty:
+                st.caption("Open Paycheck Plan to generate and review this month's funding assignments.")
+            else:
+                funding = (
+                    plan_rows.groupby(["scheduled_date", "source_name"], as_index=False)["allocated_amount"]
+                    .sum()
+                    .rename(columns={"scheduled_date": "Pay date", "source_name": "Source", "allocated_amount": "Allocated"})
+                )
+                st.dataframe(
+                    funding,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={"Allocated": st.column_config.NumberColumn(format="$%.2f")},
+                )
+    elif view == "Paycheck Plan":
+        if period_mode == "Full year":
+            st.info("Paycheck planning uses a selected month. Switch the sidebar period to Monthly.")
+        else:
+            render_paycheck_plan(conn, effective_obligations, selected_month, all_transactions)
     elif view == "Setup":
         render_setup(
             conn,
